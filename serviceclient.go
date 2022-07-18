@@ -1,10 +1,13 @@
 package goroslib
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"reflect"
 	"time"
 
+	"github.com/aler9/goroslib/pkg/protocommon"
 	"github.com/aler9/goroslib/pkg/prototcp"
 	"github.com/aler9/goroslib/pkg/serviceproc"
 )
@@ -31,6 +34,7 @@ type ServiceClient struct {
 	conf   ServiceClientConf
 	srvReq interface{}
 	srvRes interface{}
+	srvMD5 string
 	conn   *prototcp.Conn
 }
 
@@ -48,16 +52,35 @@ func NewServiceClient(conf ServiceClientConf) (*ServiceClient, error) {
 		return nil, fmt.Errorf("Srv is empty")
 	}
 
-	srvReq, srvRes, err := serviceproc.RequestResponse(conf.Srv)
+	if reflect.TypeOf(conf.Srv).Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("Srv is not a pointer")
+	}
+
+	srvElem := reflect.ValueOf(conf.Srv).Elem().Interface()
+
+	srvReq, srvRes, err := serviceproc.RequestResponse(srvElem)
 	if err != nil {
 		return nil, err
 	}
 
-	return &ServiceClient{
+	srvMD5, err := serviceproc.MD5(srvElem)
+	if err != nil {
+		return nil, err
+	}
+
+	conf.Name = conf.Node.applyCliRemapping(conf.Name)
+
+	sc := &ServiceClient{
 		conf:   conf,
 		srvReq: srvReq,
 		srvRes: srvRes,
-	}, nil
+		srvMD5: srvMD5,
+	}
+
+	sc.conf.Node.Log(LogLevelDebug, "service client '%s' created",
+		sc.conf.Node.absoluteTopicName(conf.Name))
+
+	return sc, nil
 }
 
 // Close closes a ServiceClient and shuts down all its operations.
@@ -65,11 +88,19 @@ func (sc *ServiceClient) Close() error {
 	if sc.conn != nil {
 		sc.conn.Close()
 	}
+	sc.conf.Node.Log(LogLevelDebug, "service client '%s' destroyed",
+		sc.conf.Node.absoluteTopicName(sc.conf.Name))
 	return nil
 }
 
 // Call sends a request to a service provider and reads a response.
 func (sc *ServiceClient) Call(req interface{}, res interface{}) error {
+	return sc.CallContext(context.Background(), req, res)
+}
+
+// CallContext sends a request to a service provider and reads a response.
+// It allows to set a context that can be used to terminate the function.
+func (sc *ServiceClient) CallContext(ctx context.Context, req interface{}, res interface{}) error {
 	if reflect.TypeOf(req) != reflect.PtrTo(reflect.TypeOf(sc.srvReq)) {
 		panic("wrong req")
 	}
@@ -79,12 +110,25 @@ func (sc *ServiceClient) Call(req interface{}, res interface{}) error {
 
 	connCreatedInThisCall := false
 	if sc.conn == nil {
-		err := sc.createConn()
+		err := sc.createConn(ctx)
 		if err != nil {
 			return err
 		}
 		connCreatedInThisCall = true
 	}
+
+	connCopy := sc.conn
+	funcDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			connCopy.Close()
+
+		case <-funcDone:
+			return
+		}
+	}()
+	defer close(funcDone)
 
 	err := sc.conn.WriteMessage(req)
 	if err != nil {
@@ -95,13 +139,13 @@ func (sc *ServiceClient) Call(req interface{}, res interface{}) error {
 		// linked to an invalid provider.
 		// do another try.
 		if !connCreatedInThisCall {
-			return sc.Call(req, res)
+			return sc.CallContext(ctx, req, res)
 		}
 
 		return err
 	}
 
-	err = sc.conn.ReadServiceResState()
+	state, err := sc.conn.ReadServiceResponse(res)
 	if err != nil {
 		sc.conn.Close()
 		sc.conn = nil
@@ -110,52 +154,46 @@ func (sc *ServiceClient) Call(req interface{}, res interface{}) error {
 		// linked to an invalid provider.
 		// do another try.
 		if !connCreatedInThisCall {
-			return sc.Call(req, res)
+			return sc.CallContext(ctx, req, res)
 		}
 
 		return err
 	}
 
-	err = sc.conn.ReadMessage(res)
-	if err != nil {
+	if !state {
 		sc.conn.Close()
 		sc.conn = nil
-		return err
+		return fmt.Errorf("service returned a failure state")
 	}
 
 	return nil
 }
 
-func (sc *ServiceClient) createConn() error {
-	res, err := sc.conf.Node.apiMasterClient.LookupService(
+func (sc *ServiceClient) createConn(ctx context.Context) error {
+	ur, err := sc.conf.Node.apiMasterClient.LookupService(
 		sc.conf.Node.absoluteTopicName(sc.conf.Name))
 	if err != nil {
 		return fmt.Errorf("lookupService: %v", err)
 	}
 
-	srvMD5, err := serviceproc.MD5(sc.conf.Srv)
+	address, err := urlToAddress(ur)
 	if err != nil {
 		return err
 	}
 
-	address, err := urlToAddress(res.URL)
-	if err != nil {
-		return err
-	}
-
-	conn, err := prototcp.NewClient(address)
+	conn, err := prototcp.NewClientContext(ctx, address)
 	if err != nil {
 		return err
 	}
 
 	if sc.conf.EnableKeepAlive {
-		conn.NetConn().SetKeepAlive(true)
-		conn.NetConn().SetKeepAlivePeriod(60 * time.Second)
+		conn.NetConn().(*net.TCPConn).SetKeepAlive(true)
+		conn.NetConn().(*net.TCPConn).SetKeepAlivePeriod(60 * time.Second)
 	}
 
 	err = conn.WriteHeader(&prototcp.HeaderServiceClient{
 		Callerid:   sc.conf.Node.absoluteName(),
-		Md5sum:     srvMD5,
+		Md5sum:     sc.srvMD5,
 		Persistent: 1,
 		Service:    sc.conf.Node.absoluteTopicName(sc.conf.Name),
 	})
@@ -164,17 +202,28 @@ func (sc *ServiceClient) createConn() error {
 		return err
 	}
 
-	var outHeader prototcp.HeaderServiceProvider
-	err = conn.ReadHeader(&outHeader)
+	raw, err := conn.ReadHeaderRaw()
 	if err != nil {
 		conn.Close()
 		return err
 	}
 
-	if outHeader.Md5sum != srvMD5 {
+	if strErr, ok := raw["error"]; ok {
 		conn.Close()
-		return fmt.Errorf("wrong md5sum: expected %s, got %s",
-			srvMD5, outHeader.Md5sum)
+		return fmt.Errorf(strErr)
+	}
+
+	var outHeader prototcp.HeaderServiceProvider
+	err = protocommon.HeaderDecode(raw, &outHeader)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+
+	if outHeader.Md5sum != sc.srvMD5 {
+		conn.Close()
+		return fmt.Errorf("wrong message checksum: expected %s, got %s",
+			sc.srvMD5, outHeader.Md5sum)
 	}
 
 	sc.conn = conn

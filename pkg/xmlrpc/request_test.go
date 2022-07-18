@@ -2,6 +2,7 @@ package xmlrpc
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"testing"
 
@@ -77,6 +78,109 @@ func TestRequestDecode(t *testing.T) {
 	}
 }
 
+func TestRequestDecodeErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name string
+		enc  []byte
+		err  string
+	}{
+		{
+			"empty",
+			[]byte(""),
+			"EOF",
+		},
+		{
+			"missing processing instruction",
+			[]byte(`<othertag>`),
+			"expected xml.ProcInst, got xml.StartElement",
+		},
+		{
+			"missing method call",
+			[]byte(`<?xml version="1.0"?><othertag>`),
+			"expected xml.StartElement with name 'methodCall', got 'othertag'",
+		},
+		{
+			"missing method name",
+			[]byte(`<?xml version="1.0"?><methodCall><othertag>`),
+			"expected xml.StartElement with name 'methodName', got 'othertag'",
+		},
+		{
+			"missing method name content 1",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>`),
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing method name content 2",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName></methodName>`),
+			"expected xml.CharData, got xml.EndElement",
+		},
+		{
+			"missing method name closing tag",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>asd`),
+			"XML syntax error on line 1: unexpected EOF",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			_, err := requestDecodeRaw(bytes.NewReader(ca.enc))
+			require.EqualError(t, err, ca.err)
+		})
+	}
+
+	for _, ca := range []struct {
+		name string
+		enc  []byte
+		dest interface{}
+		err  string
+	}{
+		{
+			"missing params",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>testMethodName</methodName>`),
+			nil,
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing param",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>testMethodName</methodName><params>`),
+			&struct {
+				A string
+			}{},
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing value",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>testMethodName</methodName><params><param>`),
+			&struct {
+				A string
+			}{},
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"invalid value",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>testMethodName</methodName><params><param><value>`),
+			&struct {
+				A string
+			}{},
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"not ended",
+			[]byte(`<?xml version="1.0"?><methodCall><methodName>testMethodName</methodName><params><param><value>aaa</value>`),
+			&struct {
+				A string
+			}{},
+			"XML syntax error on line 1: unexpected EOF",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			raw, err := requestDecodeRaw(bytes.NewReader(ca.enc))
+			require.NoError(t, err)
+
+			err = requestDecode(raw, ca.dest)
+			require.EqualError(t, err, ca.err)
+		})
+	}
+}
+
 func TestRequestEncode(t *testing.T) {
 	for _, ca := range casesRequest {
 		t.Run(ca.name, func(t *testing.T) {
@@ -84,6 +188,63 @@ func TestRequestEncode(t *testing.T) {
 			err := requestEncode(&buf, ca.method, ca.params)
 			require.NoError(t, err)
 			require.Equal(t, ca.benc, buf.Bytes())
+		})
+	}
+}
+
+func TestRequestEncodeErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name   string
+		method string
+		params interface{}
+		dest   io.Writer
+		err    string
+	}{
+		{
+			"open tag write error",
+			"myMethod",
+			nil,
+			&limitedBuffer{cap: 10},
+			"capacity reached",
+		},
+		{
+			"close tag write error",
+			"myMethod",
+			struct{}{},
+			&limitedBuffer{cap: 80},
+			"capacity reached",
+		},
+		{
+			"param open tag write error",
+			"myMethod",
+			struct {
+				A string
+			}{"testing"},
+			&limitedBuffer{cap: 80},
+			"capacity reached",
+		},
+		{
+			"param content write error",
+			"myMethod",
+			struct {
+				A string
+			}{"testing"},
+			&limitedBuffer{cap: 90},
+			"capacity reached",
+		},
+		{
+			"param close tag write error",
+			"myMethod",
+			struct {
+				A string
+			}{"testing"},
+			&limitedBuffer{cap: 110},
+			"capacity reached",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			err := requestEncode(ca.dest, ca.method, ca.params)
+			require.EqualError(t, err, ca.err)
 		})
 	}
 }

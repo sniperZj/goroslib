@@ -21,7 +21,7 @@ func NewClient(address string, callerID string) *Client {
 }
 
 // GetPublishedTopics writes a getPublishedTopics request.
-func (c *Client) GetPublishedTopics(subgraph string) (*ResponseGetPublishedTopics, error) {
+func (c *Client) GetPublishedTopics(subgraph string) ([][]string, error) {
 	req := RequestGetPublishedTopics{
 		CallerID: c.callerID,
 		Subgraph: subgraph,
@@ -34,15 +34,15 @@ func (c *Client) GetPublishedTopics(subgraph string) (*ResponseGetPublishedTopic
 	}
 
 	if res.Code != 1 {
-		return nil, fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return nil, fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
-	return &res, nil
+	return res.Topics, nil
 }
 
 // GetSystemState writes a getSystemState request.
-func (c *Client) GetSystemState() (*ResponseGetSystemState, error) {
+func (c *Client) GetSystemState() (*SystemState, error) {
 	req := RequestGetSystemState{
 		c.callerID,
 	}
@@ -54,15 +54,15 @@ func (c *Client) GetSystemState() (*ResponseGetSystemState, error) {
 	}
 
 	if res.Code != 1 {
-		return nil, fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return nil, fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
-	return &res, nil
+	return &res.State, nil
 }
 
 // GetTopicTypes writes a getTopicTypes request.
-func (c *Client) GetTopicTypes() (*ResponseGetTopicTypes, error) {
+func (c *Client) GetTopicTypes() ([]TopicType, error) {
 	req := RequestGetTopicTypes{
 		c.callerID,
 	}
@@ -74,15 +74,15 @@ func (c *Client) GetTopicTypes() (*ResponseGetTopicTypes, error) {
 	}
 
 	if res.Code != 1 {
-		return nil, fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return nil, fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
-	return &res, nil
+	return res.Types, nil
 }
 
 // GetURI writes a getUri request.
-func (c *Client) GetURI() (*ResponseGetURI, error) {
+func (c *Client) GetURI() (string, error) {
 	req := RequestGetURI{
 		c.callerID,
 	}
@@ -90,18 +90,18 @@ func (c *Client) GetURI() (*ResponseGetURI, error) {
 
 	err := c.xc.Do("getUri", req, &res)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	if res.Code != 1 {
-		return nil, fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return "", fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
-	return &res, nil
+	return res.MasterURI, nil
 }
 
-func (c *Client) lookup(method string, name string) (*ResponseLookup, error) {
+func (c *Client) lookup(method string, name string) (string, error) {
 	req := RequestLookup{
 		CallerID: c.callerID,
 		Name:     name,
@@ -110,29 +110,30 @@ func (c *Client) lookup(method string, name string) (*ResponseLookup, error) {
 
 	err := c.xc.Do(method, req, &res)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	if res.Code != 1 {
-		return nil, fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return "", fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
-	return &res, nil
+	return res.URL, nil
 }
 
 // LookupNode writes a lookupNode request.
-func (c *Client) LookupNode(name string) (*ResponseLookup, error) {
+func (c *Client) LookupNode(name string) (string, error) {
 	return c.lookup("lookupNode", name)
 }
 
 // LookupService writes a lookupService request.
-func (c *Client) LookupService(name string) (*ResponseLookup, error) {
+func (c *Client) LookupService(name string) (string, error) {
 	return c.lookup("lookupService", name)
 }
 
 func (c *Client) register(method string, topic string, topicType string,
-	callerURL string) (*ResponseRegister, error) {
+	callerURL string,
+) ([]string, error) {
 	req := RequestRegister{
 		CallerID:  c.callerID,
 		Topic:     topic,
@@ -147,18 +148,19 @@ func (c *Client) register(method string, topic string, topicType string,
 	}
 
 	if res.Code != 1 {
-		return nil, fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return nil, fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
-	return &res, nil
+	return res.URIs, nil
 }
 
 // RegisterSubscriber writes a registerSubscriber request.
 func (c *Client) RegisterSubscriber(
 	topic string,
 	topicType string,
-	callerURL string) (*ResponseRegister, error) {
+	callerURL string,
+) ([]string, error) {
 	return c.register("registerSubscriber", topic, topicType, callerURL)
 }
 
@@ -166,7 +168,8 @@ func (c *Client) RegisterSubscriber(
 func (c *Client) RegisterPublisher(
 	topic string,
 	topicType string,
-	callerURL string) (*ResponseRegister, error) {
+	callerURL string,
+) ([]string, error) {
 	return c.register("registerPublisher", topic, topicType, callerURL)
 }
 
@@ -184,7 +187,7 @@ func (c *Client) unregister(method string, topic string, callerURL string) error
 	}
 
 	if res.Code != 1 {
-		return fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 
@@ -209,7 +212,8 @@ func (c *Client) UnregisterPublisher(topic string, callerURL string) error {
 func (c *Client) RegisterService(
 	service string,
 	serviceURL string,
-	callerURL string) error {
+	callerURL string,
+) error {
 	req := RequestRegisterService{
 		CallerID:   c.callerID,
 		Service:    service,
@@ -224,7 +228,7 @@ func (c *Client) RegisterService(
 	}
 
 	if res.Code != 1 {
-		return fmt.Errorf("server returned an error (%d): %s", res.Code, res.StatusMessage)
+		return fmt.Errorf("server returned an error (code %d): %s", res.Code, res.StatusMessage)
 	}
 
 	return nil
@@ -233,7 +237,8 @@ func (c *Client) RegisterService(
 // UnregisterService writes a unregisterService request.
 func (c *Client) UnregisterService(
 	service string,
-	serviceURL string) error {
+	serviceURL string,
+) error {
 	req := RequestUnregisterService{
 		CallerID:   c.callerID,
 		Service:    service,
@@ -247,7 +252,7 @@ func (c *Client) UnregisterService(
 	}
 
 	if res.Code != 1 {
-		return fmt.Errorf("server returned an error (%d): %s", res.Code,
+		return fmt.Errorf("server returned an error (code %d): %s", res.Code,
 			res.StatusMessage)
 	}
 

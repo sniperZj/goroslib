@@ -46,19 +46,55 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gookit/color"
+
 	"github.com/aler9/goroslib/pkg/apimaster"
 	"github.com/aler9/goroslib/pkg/apiparam"
 	"github.com/aler9/goroslib/pkg/apislave"
 	"github.com/aler9/goroslib/pkg/msgs/rosgraph_msgs"
+	"github.com/aler9/goroslib/pkg/msgs/std_msgs"
 	"github.com/aler9/goroslib/pkg/prototcp"
 	"github.com/aler9/goroslib/pkg/protoudp"
-	"github.com/aler9/goroslib/pkg/xmlrpc"
 )
+
+func urlToAddress(in string) (string, error) {
+	u, err := url.Parse(in)
+	if err != nil {
+		return "", err
+	}
+
+	return u.Host, nil
+}
+
+func findNodeHost(masterAddr *net.TCPAddr) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, i := range ifaces {
+		addrs, err := i.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if v, ok := addr.(*net.IPNet); ok {
+				if v.Contains(masterAddr.IP) {
+					return v.IP.String()
+				}
+			}
+		}
+	}
+	return ""
+}
 
 type getPublicationsReq struct {
 	res chan [][]string
@@ -105,23 +141,45 @@ type subscriberRequestTopicReq struct {
 
 type subscriberNewReq struct {
 	sub *Subscriber
-	err chan error
+	res chan error
 }
 
 type publisherNewReq struct {
 	pub *Publisher
-	err chan error
+	res chan error
 }
 
 type serviceProviderNewReq struct {
 	sp  *ServiceProvider
-	err chan error
+	res chan error
 }
 
 type simtimeSleep struct {
 	value time.Time
-	done  chan struct{}
+	done  chan time.Time
 }
+
+// LogLevel is the level of a log message.
+type LogLevel int
+
+// standard log levels (http://wiki.ros.org/roscpp/Overview/Logging)
+const (
+	LogLevelDebug LogLevel = iota + 1
+	LogLevelInfo
+	LogLevelWarn
+	LogLevelError
+	LogLevelFatal
+)
+
+// LogDestination is the destination of a log message.
+type LogDestination int
+
+// available destinations.
+const (
+	LogDestinationConsole  LogDestination = 0x01
+	LogDestinationRosout   LogDestination = 0x02
+	LogDestinationCallback LogDestination = 0x04
+)
 
 // NodeConf is the configuration of a Node.
 type NodeConf struct {
@@ -138,24 +196,39 @@ type NodeConf struct {
 
 	// (optional) hostname or ip of this node, needed by other nodes
 	// in order to communicate with it.
-	// if not provided, it will be set automatically.
+	// It defaults to an automatic IP.
 	Host string
 
 	// (optional) port of the Slave API server of this node.
-	// if not provided, it will be chosen automatically.
+	// It defaults to a random port.
 	ApislavePort int
 
 	// (optional) port of the TCPROS server of this node.
-	// if not provided, it will be chosen automatically.
+	// It defaults to a random port.
 	TcprosPort int
 
 	// (optional) port of the UDPROS server of this node.
-	// if not provided, it will be chosen automatically.
+	// It defaults to a random port.
 	UdprosPort int
+
+	// (optional) minimum severity level of log messages that will be
+	// written to stdout/stderr or sent to /rosout.
+	// It defaults to LogLevelInfo.
+	LogLevel LogLevel
+
+	// (optional) destinations of log messages.
+	// It defaults to LogDestinationConsole | LogDestinationRosout | LogDestinationCallback
+	LogDestinations LogDestination
+
+	// (optional) a function that will be called for every log message.
+	// It defaults to nil.
+	OnLog func(LogLevel, string)
+
+	args []string
 }
 
-// Node is a ROS Node, an entity that can create subscribers, publishers, service providers
-// and service clients.
+// Node is a ROS Node, an entity that can create subscribers, publishers, service providers,
+// service clients, action servers and action clients.
 type Node struct {
 	conf NodeConf
 
@@ -166,9 +239,7 @@ type Node struct {
 	apiMasterClient     *apimaster.Client
 	apiParamClient      *apiparam.Client
 	apiSlaveServer      *apislave.Server
-	apiSlaveServerURL   string
 	tcprosServer        *prototcp.Server
-	tcprosServerURL     string
 	udprosServer        *protoudp.Server
 	tcprosConns         map[*prototcp.Conn]struct{}
 	udprosSubPublishers map[*subscriberPublisher]struct{}
@@ -209,6 +280,9 @@ type Node struct {
 
 // NewNode allocates a Node. See NodeConf for the options.
 func NewNode(conf NodeConf) (*Node, error) {
+	if os.Getenv("ROS_NAMESPACE") != "" {
+		conf.Namespace = os.Getenv("ROS_NAMESPACE")
+	}
 	if conf.Namespace == "" {
 		conf.Namespace = "/"
 	}
@@ -230,6 +304,17 @@ func NewNode(conf NodeConf) (*Node, error) {
 		conf.MasterAddress = "127.0.0.1:11311"
 	}
 
+	if conf.LogLevel == 0 {
+		conf.LogLevel = LogLevelInfo
+	}
+	if conf.LogDestinations == 0 {
+		conf.LogDestinations = LogDestinationConsole | LogDestinationCallback | LogDestinationRosout
+	}
+
+	if conf.args == nil {
+		conf.args = os.Args
+	}
+
 	// support ROS-style master address, in order to increase interoperability
 	conf.MasterAddress = strings.TrimPrefix(conf.MasterAddress, "http://")
 
@@ -239,33 +324,12 @@ func NewNode(conf NodeConf) (*Node, error) {
 		return nil, fmt.Errorf("unable to solve master address: %s", err)
 	}
 	if masterAddr.Zone != "" {
-		return nil, fmt.Errorf("the master address has a stateless IPv6, which is not supported")
+		return nil, fmt.Errorf("stateless IPv6 master addresses are not supported")
 	}
 
 	// find an ip in the same subnet of the master
 	if conf.Host == "" {
-		conf.Host = func() string {
-			ifaces, err := net.Interfaces()
-			if err != nil {
-				return ""
-			}
-
-			for _, i := range ifaces {
-				addrs, err := i.Addrs()
-				if err != nil {
-					continue
-				}
-
-				for _, addr := range addrs {
-					if v, ok := addr.(*net.IPNet); ok {
-						if v.Contains(masterAddr.IP) {
-							return v.IP.String()
-						}
-					}
-				}
-			}
-			return ""
-		}()
+		conf.Host = findNodeHost(masterAddr)
 		if conf.Host == "" {
 			return nil, fmt.Errorf("unable to set Host automatically")
 		}
@@ -314,24 +378,26 @@ func NewNode(conf NodeConf) (*Node, error) {
 		done:                   make(chan struct{}),
 	}
 
+	n.conf.Name = n.applyCliRemapping(n.conf.Name)
+
 	n.apiMasterClient = apimaster.NewClient(masterAddr.String(), n.absoluteName())
 
 	n.apiParamClient = apiparam.NewClient(masterAddr.String(), n.absoluteName())
 
-	n.apiSlaveServer, err = apislave.NewServer(":" + strconv.FormatInt(int64(conf.ApislavePort), 10))
+	n.apiSlaveServer, err = apislave.NewServer(nodeAddr.IP.String()+":"+strconv.FormatInt(int64(conf.ApislavePort), 10),
+		nodeAddr.IP, nodeAddr.Zone)
 	if err != nil {
 		return nil, err
 	}
-	n.apiSlaveServerURL = xmlrpc.ServerURL(nodeAddr, n.apiSlaveServer.Port())
 
-	n.tcprosServer, err = prototcp.NewServer(conf.TcprosPort)
+	n.tcprosServer, err = prototcp.NewServer(nodeAddr.IP.String()+":"+strconv.FormatInt(int64(conf.TcprosPort), 10),
+		nodeAddr.IP, nodeAddr.Zone)
 	if err != nil {
 		n.apiSlaveServer.Close()
 		return nil, err
 	}
-	n.tcprosServerURL = prototcp.ServerURL(nodeAddr, n.tcprosServer.Port())
 
-	n.udprosServer, err = protoudp.NewServer(conf.UdprosPort)
+	n.udprosServer, err = protoudp.NewServer(nodeAddr.IP.String() + ":" + strconv.FormatInt(int64(conf.UdprosPort), 10))
 	if err != nil {
 		n.tcprosServer.Close()
 		n.apiSlaveServer.Close()
@@ -349,6 +415,8 @@ func NewNode(conf NodeConf) (*Node, error) {
 		n.Close()
 		return nil, err
 	}
+
+	n.Log(LogLevelDebug, "node '%s' created", n.absoluteName())
 
 	isSet, err := n.ParamIsSet("/use_sim_time")
 	if err != nil {
@@ -407,7 +475,81 @@ func NewNode(conf NodeConf) (*Node, error) {
 func (n *Node) Close() error {
 	n.ctxCancel()
 	<-n.done
+	n.Log(LogLevelDebug, "node '%s' destroyed", n.absoluteName())
 	return nil
+}
+
+// Log writes a log message.
+// This is implemented like the reference C++ implementation,
+// except for the log file.
+// (http://wiki.ros.org/roscpp/Overview/Logging)
+func (n *Node) Log(level LogLevel, format string, args ...interface{}) {
+	if level < n.conf.LogLevel {
+		return
+	}
+
+	msg := fmt.Sprintf(format, args...)
+	now := time.Now()
+
+	if (n.conf.LogDestinations & LogDestinationConsole) != 0 {
+		formatted := msg
+
+		switch level {
+		case LogLevelDebug:
+			formatted = "[DEBUG] " + formatted
+		case LogLevelInfo:
+			formatted = "[INFO] " + formatted
+		case LogLevelWarn:
+			formatted = "[WARN] " + formatted
+		case LogLevelError:
+			formatted = "[ERROR] " + formatted
+		case LogLevelFatal:
+			formatted = "[FATAL] " + formatted
+		}
+
+		formatted = now.Format("[2006/01/02 15:04:05]") + " " + formatted
+
+		switch level {
+		case LogLevelDebug:
+			os.Stderr.WriteString(color.RenderString(color.Gray.Code(), formatted) + "\n")
+
+		case LogLevelInfo:
+			os.Stdout.WriteString(formatted + "\n")
+
+		case LogLevelWarn:
+			os.Stderr.WriteString(color.RenderString(color.Yellow.Code(), formatted) + "\n")
+
+		case LogLevelError, LogLevelFatal:
+			os.Stderr.WriteString(color.RenderString(color.Red.Code(), formatted) + "\n")
+		}
+	}
+
+	if (n.conf.LogDestinations&LogDestinationRosout) != 0 && n.rosoutPublisher != nil {
+		n.rosoutPublisher.Write(&rosgraph_msgs.Log{
+			Header: std_msgs.Header{
+				Stamp: now,
+			},
+			Level: func() int8 {
+				switch level {
+				case LogLevelDebug:
+					return rosgraph_msgs.Log_DEBUG
+				case LogLevelInfo:
+					return rosgraph_msgs.Log_INFO
+				case LogLevelWarn:
+					return rosgraph_msgs.Log_WARN
+				case LogLevelError:
+					return rosgraph_msgs.Log_ERROR
+				}
+				return rosgraph_msgs.Log_FATAL
+			}(),
+			Name: n.absoluteName(),
+			Msg:  msg,
+		})
+	}
+
+	if (n.conf.LogDestinations&LogDestinationCallback) != 0 && n.conf.OnLog != nil {
+		n.conf.OnLog(level, msg)
+	}
 }
 
 func (n *Node) absoluteTopicName(topic string) string {
@@ -430,6 +572,18 @@ func (n *Node) absoluteName() string {
 	return n.conf.Namespace + "/" + n.conf.Name
 }
 
+func (n *Node) applyCliRemapping(v string) string {
+	for _, cliArg := range n.conf.args {
+		remapArg := strings.Split(cliArg, ":=")
+		if len(remapArg) == 2 { // only match ros remapping args chatter:=/talker
+			if v == remapArg[0] {
+				return remapArg[1]
+			}
+		}
+	}
+	return v
+}
+
 func (n *Node) run() {
 	defer close(n.done)
 
@@ -448,7 +602,10 @@ outer:
 		case req := <-n.getPublications:
 			res := [][]string{}
 			for _, pub := range n.publishers {
-				res = append(res, []string{pub.conf.Topic, pub.msgType})
+				res = append(res, []string{
+					n.absoluteTopicName(pub.conf.Topic),
+					pub.msgType,
+				})
 			}
 			req.res <- res
 
@@ -474,9 +631,8 @@ outer:
 			}
 
 			req.res <- apislave.ResponseGetBusInfo{
-				Code:          1,
-				StatusMessage: "",
-				BusInfo:       busInfo,
+				Code:    1,
+				BusInfo: busInfo,
 			}
 
 		case <-n.ctx.Done():
@@ -533,8 +689,8 @@ outer:
 		case req := <-n.udpFrame:
 			for sp := range n.udprosSubPublishers {
 				if req.frame.ConnectionID == sp.udpID &&
-					req.source.IP.Equal(sp.udpAddr.IP) {
-
+					(req.source.IP.Equal(sp.udpAddr.IP) ||
+						(sp.udpAddrIsLocal && sp.localIPs.contains(req.source.IP))) {
 					select {
 					case sp.udpFrame <- req.frame:
 					case <-sp.ctx.Done():
@@ -565,25 +721,25 @@ outer:
 		case req := <-n.subscriberNew:
 			_, ok := n.subscribers[n.absoluteTopicName(req.sub.conf.Topic)]
 			if ok {
-				req.err <- fmt.Errorf("Topic %s already subscribed", req.sub.conf.Topic)
+				req.res <- fmt.Errorf("Topic %s already subscribed", req.sub.conf.Topic)
 				continue
 			}
 
-			res, err := n.apiMasterClient.RegisterSubscriber(
+			uris, err := n.apiMasterClient.RegisterSubscriber(
 				n.absoluteTopicName(req.sub.conf.Topic),
 				req.sub.msgType,
-				n.apiSlaveServerURL)
+				n.apiSlaveServer.URL())
 			if err != nil {
-				req.err <- err
+				req.res <- err
 				continue
 			}
 
 			n.subscribers[n.absoluteTopicName(req.sub.conf.Topic)] = req.sub
-			req.err <- nil
+			req.res <- nil
 
 			// send initial publishers list to subscriber
 			select {
-			case req.sub.subscriberPubUpdate <- res.URIs:
+			case req.sub.subscriberPubUpdate <- uris:
 			case <-req.sub.ctx.Done():
 			}
 
@@ -604,23 +760,23 @@ outer:
 		case req := <-n.publisherNew:
 			_, ok := n.publishers[n.absoluteTopicName(req.pub.conf.Topic)]
 			if ok {
-				req.err <- fmt.Errorf("Topic %s already published", req.pub.conf.Topic)
+				req.res <- fmt.Errorf("Topic %s already published", req.pub.conf.Topic)
 				continue
 			}
 
 			_, err := n.apiMasterClient.RegisterPublisher(
 				n.absoluteTopicName(req.pub.conf.Topic),
 				req.pub.msgType,
-				n.apiSlaveServerURL)
+				n.apiSlaveServer.URL())
 			if err != nil {
-				req.err <- err
+				req.res <- err
 				continue
 			}
 
 			n.publisherLastID++
 			req.pub.id = n.publisherLastID
 			n.publishers[n.absoluteTopicName(req.pub.conf.Topic)] = req.pub
-			req.err <- nil
+			req.res <- nil
 
 		case pub := <-n.publisherClose:
 			delete(n.publishers, n.absoluteTopicName(pub.conf.Topic))
@@ -628,21 +784,21 @@ outer:
 		case req := <-n.serviceProviderNew:
 			_, ok := n.serviceProviders[n.absoluteTopicName(req.sp.conf.Name)]
 			if ok {
-				req.err <- fmt.Errorf("Service %s already provided", req.sp.conf.Name)
+				req.res <- fmt.Errorf("Service %s already provided", req.sp.conf.Name)
 				continue
 			}
 
 			err := n.apiMasterClient.RegisterService(
 				n.absoluteTopicName(req.sp.conf.Name),
-				n.tcprosServerURL,
-				n.apiSlaveServerURL)
+				n.tcprosServer.URL(),
+				n.apiSlaveServer.URL())
 			if err != nil {
-				req.err <- err
+				req.res <- err
 				continue
 			}
 
 			n.serviceProviders[n.absoluteTopicName(req.sp.conf.Name)] = req.sp
-			req.err <- nil
+			req.res <- nil
 
 		case sp := <-n.serviceProviderClose:
 			delete(n.serviceProviders, n.absoluteTopicName(sp.conf.Name))

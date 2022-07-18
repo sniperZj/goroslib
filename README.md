@@ -3,6 +3,7 @@
 
 [![Test](https://github.com/aler9/goroslib/workflows/test/badge.svg)](https://github.com/aler9/goroslib/actions?query=workflow:test)
 [![Lint](https://github.com/aler9/goroslib/workflows/lint/badge.svg)](https://github.com/aler9/goroslib/actions?query=workflow:lint)
+[![Go Report Card](https://goreportcard.com/badge/github.com/aler9/goroslib)](https://goreportcard.com/report/github.com/aler9/goroslib)
 [![CodeCov](https://codecov.io/gh/aler9/goroslib/branch/main/graph/badge.svg)](https://codecov.io/gh/aler9/goroslib/branch/main)
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/aler9/goroslib)](https://pkg.go.dev/github.com/aler9/goroslib#pkg-index)
 
@@ -12,17 +13,17 @@ The Robot Operating System (ROS) is a project that provides a specification to m
 
 Features:
 
-* Subscribe and publish to topics, with TCP or UDP
-* Provide and call services
-* Provide and call actions and simple actions
-* Get and set parameters
-* Get infos about other nodes, topics, services
-* Use namespaces and relative topics
-* Use a time API to synchronize execution with a real or simulated clock
-* Support IPv6 (only stateful addresses, since stateless are not supported by the ROS master)
-* Compilation of `.msg` files is not necessary, message definitions are extracted from code
-* Compile or cross-compile ROS nodes for all Golang supported OSs (Linux, Windows, Mac OS X) and architectures
-* Examples provided for every feature, comprehensive test suite, continuous integration
+* publish and subscribe to topics with TCP or UDP
+* provide and call services
+* provide and call actions
+* provide and call simple actions
+* get and set parameters
+* support namespaces and relative topics
+* support IPv6 (stateful addresses only)
+* support time API
+* compilation of `.msg` files is not necessary, message definitions are extracted from code
+* compile or cross-compile for all Go supported OSs (Linux, Windows, Mac OS X) and architectures
+* examples provided for every feature, comprehensive test suite, continuous integration
 
 ## Table of contents
 
@@ -34,14 +35,13 @@ Features:
   * [Use standard messages, services and actions](#use-standard-messages-services-and-actions)
   * [Define custom messages, services and actions](#define-custom-messages-services-and-actions)
   * [Import existing messages, services and actions](#import-existing-messages-services-and-actions)
-  * [Change namespace](#change-namespace)
   * [Compile a node for another operating system](#compile-a-node-for-another-operating-system)
   * [Edit the library](#edit-the-library)
 * [Links](#links)
 
 ## Installation
 
-1. Install Go &ge; 1.14.
+1. Install Go &ge; 1.16.
 
 2. Create an empty folder, open a terminal in it and initialize the Go modules system:
 
@@ -58,13 +58,9 @@ Features:
    * [publisher](examples/publisher/main.go)
    * [publisher-custom](examples/publisher-custom/main.go)
    * [serviceclient](examples/serviceclient/main.go)
-   * [serviceclient-custom](examples/serviceclient-custom/main.go)
    * [serviceprovider](examples/serviceprovider/main.go)
-   * [serviceprovider-custom](examples/serviceprovider-custom/main.go)
    * [simpleactionclient](examples/simpleactionclient/main.go)
-   * [simpleactionclient-custom](examples/simpleactionclient-custom/main.go)
    * [simpleactionserver](examples/simpleactionserver/main.go)
-   * [simpleactionserver-custom](examples/simpleactionserver-custom/main.go)
    * [param-set-get](examples/param-set-get/main.go)
    * [cluster-info](examples/cluster-info/main.go)
 
@@ -117,6 +113,8 @@ This library provides most of the standard messages, services and actions in the
 |std_msgs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/std_msgs)|[link](https://github.com/ros/std_msgs)|
 |std_srvs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/std_srvs)|[link](https://github.com/ros/ros_comm_msgs)|
 |stereo_msgs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/stereo_msgs)|[link](https://github.com/ros/common_msgs)|
+|tf|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/tf)|[link](https://github.com/ros/geometry)|
+|tf2_msgs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/tf2_msgs)|[link](https://github.com/ros/geometry2)|
 |trajectory_msgs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/trajectory_msgs)|[link](https://github.com/ros/common_msgs)|
 |uuid_msgs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/uuid_msgs)|[link](https://github.com/ros-geographic-info/unique_identifier)|
 |velodyne_msgs|[link](https://pkg.go.dev/github.com/aler9/goroslib/pkg/msgs/velodyne_msgs)|[link](https://github.com/ros-drivers/velodyne)|
@@ -237,40 +235,26 @@ type ActionName struct {
 
 ### Import existing messages, services and actions
 
-A command-line utility is provided to convert existing `.msg` files into their equivalent Go structures:
+You can convert existing `.msg` files into their equivalent Go structures by using the `msg-import` tool:
 
 ```
 go get github.com/aler9/goroslib/cmd/msg-import
 msg-import --rospackage=my_package mymessage.msg > mymessage.go
 ```
 
-Another one is provided to convert existing `.srv` files into their equivalent Go structures:
+You can convert existing `.srv` files into their equivalent Go structures by using the `srv-import` tool:
 
 ```
 go get github.com/aler9/goroslib/cmd/srv-import
 srv-import --rospackage=my_package myservice.srv > myservice.go
 ```
 
-Another one is provided to convert existing `.action` files into their equivalent Go structures:
+You can convert existing `.action` files into their equivalent Go structures by using the `action-import` tool:
 
 ```
 go get github.com/aler9/goroslib/cmd/action-import
 action-import --rospackage=my_package myaction.action > myaction.go
 ```
-
-### Change namespace
-
-There's a field `Namespace` in the `Node` configuration:
-
-```go
-goroslib.NewNode(goroslib.NodeConf{
-    Namespace:     "/mynamespace",
-    Name:          "goroslib",
-    MasterAddress: "127.0.0.1:11311",
-})
-```
-
-The default namespace is `/` (global namespace).
 
 ### Compile a node for another operating system
 
@@ -290,24 +274,6 @@ make test
 
 ## Links
 
-(v1) ROS Documentation
-
-* Conventions
-  * https://wiki.ros.org/ROS/Technical%20Overview
-  * https://wiki.ros.org/Implementing%20Client%20Libraries
-  * http://wiki.ros.org/Names
-  * http://wiki.ros.org/actionlib
-  * http://wiki.ros.org/actionlib/DetailedDescription
-* APIs
-  * https://wiki.ros.org/ROS/Master_API
-  * https://wiki.ros.org/ROS/Parameter%20Server%20API
-  * https://wiki.ros.org/ROS/Slave_API
-* Protocols
-  * https://wiki.ros.org/ROS/Connection%20Header
-  * https://wiki.ros.org/ROS/TCPROS
-  * https://wiki.ros.org/ROS/UDPROS
-  * https://fossies.org/linux/wireshark/epan/dissectors/packet-prototcp.c
-
 Other Go libraries
 
 * (v1) https://github.com/akio/rosgo
@@ -315,11 +281,30 @@ Other Go libraries
 
 Other non-Go libraries
 
-* (v1) [cpp] https://github.com/ros/ros_comm/tree/melodic-devel/clients/roscpp/src/libros (https://docs.ros.org/melodic/api/roscpp/html/classros_1_1NodeHandle.html)
-* (v1) [python] https://docs.ros.org/melodic/api/rosnode/html/
-* (v1) [c] https://github.com/ros-industrial/cros
-* (v2) [misc] https://fkromer.github.io/awesome-ros2/
+* (v1, C++) https://github.com/ros/ros_comm/tree/noetic-devel/clients/roscpp/src/libros - https://docs.ros.org/noetic/api/roscpp/html/classros_1_1NodeHandle.html
+* (v1, Python) https://docs.ros.org/noetic/api/rosnode/html/
+* (v1, C) https://github.com/ros-industrial/cros
+* (v1, TypeScript) https://github.com/foxglove/ros1
+* (v2, misc) https://fkromer.github.io/awesome-ros2/
+* (v2, TypeScript) https://github.com/foxglove/ros2
 
-Conventions
+Standards
 
-* https://github.com/golang-standards/project-layout
+* ROS v1
+  * General
+    * https://wiki.ros.org/ROS/Technical%20Overview
+    * https://wiki.ros.org/Implementing%20Client%20Libraries
+    * http://wiki.ros.org/Names
+    * http://wiki.ros.org/actionlib
+    * http://wiki.ros.org/actionlib/DetailedDescription
+  * APIs
+    * https://wiki.ros.org/ROS/Master_API
+    * https://wiki.ros.org/ROS/Parameter%20Server%20API
+    * https://wiki.ros.org/ROS/Slave_API
+  * Protocols
+    * https://wiki.ros.org/ROS/Connection%20Header
+    * https://wiki.ros.org/ROS/TCPROS
+    * https://wiki.ros.org/ROS/UDPROS
+    * https://fossies.org/linux/wireshark/epan/dissectors/packet-prototcp.c
+
+* Golang project layout https://github.com/golang-standards/project-layout

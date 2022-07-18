@@ -2,26 +2,27 @@ package prototcp
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/aler9/goroslib/pkg/protocommon"
 )
 
 const (
-	bufferSize = 2048
+	bufferSize   = 2048
+	writeTimeout = 10 * time.Second
+	readTimeout  = 10 * time.Second
 )
 
 // Conn is a TCPROS connection.
 type Conn struct {
-	nconn    *net.TCPConn
+	nconn    net.Conn
 	readBuf  *bufio.Reader
 	writeBuf *bufio.Writer
 }
 
-// NewConn allocates a Conn from a *net.TCPConn.
-func NewConn(nconn *net.TCPConn) *Conn {
+func newConn(nconn net.Conn) *Conn {
 	return &Conn{
 		nconn:    nconn,
 		readBuf:  bufio.NewReaderSize(nconn, bufferSize),
@@ -34,32 +35,20 @@ func (c *Conn) Close() error {
 	return c.nconn.Close()
 }
 
-// NetConn returns the underlying *net.TCPConn.
-func (c *Conn) NetConn() *net.TCPConn {
+// NetConn returns the underlying net.Conn.
+func (c *Conn) NetConn() net.Conn {
 	return c.nconn
 }
 
 // ReadHeaderRaw reads an HeaderRaw.
 func (c *Conn) ReadHeaderRaw() (protocommon.HeaderRaw, error) {
+	c.nconn.SetReadDeadline(time.Now().Add(readTimeout))
 	return protocommon.HeaderRawDecode(c.readBuf)
-}
-
-// ReadHeader reads an Header.
-func (c *Conn) ReadHeader(header protocommon.Header) error {
-	raw, err := protocommon.HeaderRawDecode(c.readBuf)
-	if err != nil {
-		return err
-	}
-
-	if strErr, ok := raw["error"]; ok {
-		return fmt.Errorf(strErr)
-	}
-
-	return protocommon.HeaderDecode(raw, header)
 }
 
 // WriteHeader writes an header.
 func (c *Conn) WriteHeader(header protocommon.Header) error {
+	c.nconn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	err := protocommon.HeaderEncode(c.writeBuf, header)
 	if err != nil {
 		return err
@@ -67,35 +56,69 @@ func (c *Conn) WriteHeader(header protocommon.Header) error {
 	return c.writeBuf.Flush()
 }
 
-// ReadServiceResState reads the response of a service state request.
-func (c *Conn) ReadServiceResState() error {
+// ReadServiceResponse reads the response of a service request.
+func (c *Conn) ReadServiceResponse(msg interface{}) (bool, error) {
+	c.nconn.SetReadDeadline(time.Now().Add(readTimeout))
+
+	// read state
 	byt := make([]byte, 1)
 	_, err := io.ReadFull(c.readBuf, byt)
+	if err != nil {
+		return false, err
+	}
+	state := (byt[0] == 1)
+
+	// stop if state is false
+	if !state {
+		return state, nil
+	}
+
+	// read message
+	err = protocommon.MessageDecode(c.readBuf, msg)
+	return state, err
+}
+
+// WriteServiceResponse writes the response of a service request.
+func (c *Conn) WriteServiceResponse(state bool, res interface{}) error {
+	c.nconn.SetWriteDeadline(time.Now().Add(writeTimeout))
+
+	// write state
+	b := byte(0)
+	if state {
+		b = 1
+	}
+	_, err := c.writeBuf.Write([]byte{b})
 	if err != nil {
 		return err
 	}
 
-	if byt[0] != 1 {
-		return fmt.Errorf("service returned an error")
+	// stop if state is false
+	if !state {
+		return nil
 	}
 
-	return nil
-}
+	// write message
+	err = protocommon.MessageEncode(c.writeBuf, res)
+	if err != nil {
+		return err
+	}
 
-// WriteServiceResState writes the response of a service state request.
-func (c *Conn) WriteServiceResState() error {
-	// do not flush, since WriteServiceResState() is always called before a WriteMessage()
-	_, err := c.writeBuf.Write([]byte{1})
-	return err
+	return c.writeBuf.Flush()
 }
 
 // ReadMessage reads a message.
-func (c *Conn) ReadMessage(msg interface{}) error {
+func (c *Conn) ReadMessage(msg interface{}, timeout bool) error {
+	if timeout {
+		c.nconn.SetReadDeadline(time.Now().Add(readTimeout))
+	} else {
+		c.nconn.SetReadDeadline(time.Time{})
+	}
 	return protocommon.MessageDecode(c.readBuf, msg)
 }
 
 // WriteMessage writes a message.
 func (c *Conn) WriteMessage(msg interface{}) error {
+	c.nconn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	err := protocommon.MessageEncode(c.writeBuf, msg)
 	if err != nil {
 		return err

@@ -40,6 +40,10 @@ type {{ .Name }} struct {
 }
 `))
 
+func firstCharToUpper(s string) string {
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
 // Definition is a message definition.
 type Definition struct {
 	RosType   string
@@ -93,11 +97,104 @@ type MessageDefinition struct {
 	Imports        map[string]struct{}
 }
 
+func parseField(rosPkgName string, res *MessageDefinition, typ string, name string) {
+	f := Field{}
+
+	// use NameOverride if a bidirectional conversion between snake and
+	// camel is not possible
+	f.Name = snakeToCamel(name)
+	if camelToSnake(f.Name) != name {
+		f.NameOverride = name
+	}
+
+	// split TypeArray and Type
+	ma := regexp.MustCompile(`^(.+?)(\[.*?\])$`).FindStringSubmatch(typ)
+	if ma != nil {
+		f.TypeArray = ma[2]
+		f.Type = ma[1]
+	} else {
+		f.Type = typ
+	}
+
+	f.TypePkg, f.Type = func() (string, string) {
+		// explicit package
+		parts := strings.Split(f.Type, "/")
+		if len(parts) == 2 {
+			// type of same package
+			if parts[0] == rosPkgName {
+				return "", parts[1]
+			}
+
+			// type of other package
+			return parts[0], parts[1]
+		}
+
+		// implicit package, type of std_msgs
+		if rosPkgName != "std_msgs" {
+			switch f.Type {
+			case "Bool", "ColorRGBA",
+				"Duration", "Empty", "Float32MultiArray", "Float32",
+				"Float64MultiArray", "Float64", "Header", "Int8MultiArray",
+				"Int8", "Int16MultiArray", "Int16", "Int32MultiArray", "Int32",
+				"Int64MultiArray", "Int64", "MultiArrayDimension", "MultiarrayLayout",
+				"String", "Time", "UInt8MultiArray", "UInt8", "UInt16MultiArray", "UInt16",
+				"UInt32MultiArray", "UInt32", "UInt64MultiArray", "UInt64":
+				return "std_msgs", parts[0]
+			}
+		}
+
+		// implicit package, native type
+		switch f.Type {
+		case "bool", "int8", "uint8", "int16", "uint16",
+			"int32", "uint32", "int64", "uint64", "float32",
+			"float64", "string":
+			return "", f.Type
+
+		case "time", "duration":
+			return "time", firstCharToUpper(f.Type)
+
+		case "byte":
+			return "", "int8 `rostype:\"byte\"`"
+
+		case "char":
+			return "", "uint8 `rostype:\"char\"`"
+		}
+
+		// implicit package, other message
+		return "", f.Type
+	}()
+
+	res.Fields = append(res.Fields, f)
+}
+
+func parseDefinition(rosPkgName string, res *MessageDefinition, typ string, name string, val string) {
+	d := Definition{
+		RosType: typ,
+		Name:    name,
+		Value:   val,
+	}
+
+	d.Value = strings.ReplaceAll(d.Value, "\"", "\\\"")
+
+	d.GoType = func() string {
+		switch d.RosType {
+		case "byte":
+			return "int8"
+
+		case "char":
+			return "uint8"
+		}
+		return d.RosType
+	}()
+
+	res.Definitions = append(res.Definitions, d)
+}
+
 // ParseMessageDefinition parses a message definition.
 func ParseMessageDefinition(goPkgName string, rosPkgName, name string, content string) (*MessageDefinition, error) {
 	res := &MessageDefinition{
 		RosPkgName: rosPkgName,
-		Name:       name,
+		Name:       firstCharToUpper(name),
 	}
 
 	for _, line := range strings.Split(content, "\n") {
@@ -107,116 +204,28 @@ func ParseMessageDefinition(goPkgName string, rosPkgName, name string, content s
 		// remove leading and trailing spaces
 		line = strings.TrimSpace(line)
 
-		// do not process empty lines
+		// skip empty lines
 		if line == "" {
 			continue
 		}
 
-		// definition
-		if strings.Contains(line, "=") {
-			matches := regexp.MustCompile(`^([a-z0-9]+)(\s|\t)+([A-Z0-9_]+)(\s|\t)*=(\s|\t)*(.+?)$`).FindStringSubmatch(line)
-			if matches == nil {
-				return nil, fmt.Errorf("unable to parse definition (%s)", line)
-			}
+		i := strings.IndexAny(line, " \t")
+		if i < 0 {
+			return nil, fmt.Errorf("unable to parse line (%s)", line)
+		}
+		typ, line := line[:i], line[i+1:]
 
-			d := Definition{
-				RosType: matches[1],
-				Name:    matches[3],
-				Value:   matches[6],
-			}
+		line = strings.TrimLeft(line, " \t")
 
-			d.Value = strings.ReplaceAll(d.Value, "\"", "\\\"")
-
-			d.GoType = func() string {
-				switch d.RosType {
-				case "byte":
-					return "int8"
-
-				case "char":
-					return "uint8"
-				}
-				return d.RosType
-			}()
-
-			res.Definitions = append(res.Definitions, d)
-
-			// field
+		i = strings.IndexByte(line, '=')
+		if i < 0 {
+			name := line
+			parseField(rosPkgName, res, typ, name)
 		} else {
-			// remove multiple spaces between type and name
-			line = regexp.MustCompile(`\s+`).ReplaceAllString(line, " ")
-
-			parts := strings.Split(line, " ")
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("unable to parse field (%s)", line)
-			}
-
-			f := Field{}
-
-			// use NameOverride if a bidirectional conversion between snake and
-			// camel is not possible
-			f.Name = snakeToCamel(parts[1])
-			if camelToSnake(f.Name) != parts[1] {
-				f.NameOverride = parts[1]
-			}
-
-			f.Type = parts[0]
-
-			// split TypeArray and Type
-			ma := regexp.MustCompile(`^(.+?)(\[.*?\])$`).FindStringSubmatch(f.Type)
-			if ma != nil {
-				f.TypeArray = ma[2]
-				f.Type = ma[1]
-			}
-
-			f.TypePkg, f.Type = func() (string, string) {
-				// explicit package
-				parts := strings.Split(f.Type, "/")
-				if len(parts) == 2 {
-					// type of same package
-					if parts[0] == goPkgName {
-						return "", parts[1]
-					}
-
-					// type of other package
-					return parts[0], parts[1]
-				}
-
-				// implicit package, type of std_msgs
-				if goPkgName != "std_msgs" {
-					switch f.Type {
-					case "Bool", "ColorRGBA",
-						"Duration", "Empty", "Float32MultiArray", "Float32",
-						"Float64MultiArray", "Float64", "Header", "Int8MultiArray",
-						"Int8", "Int16MultiArray", "Int16", "Int32MultiArray", "Int32",
-						"Int64MultiArray", "Int64", "MultiArrayDimension", "MultiarrayLayout",
-						"String", "Time", "UInt8MultiArray", "UInt8", "UInt16MultiArray", "UInt16",
-						"UInt32MultiArray", "UInt32", "UInt64MultiArray", "UInt64":
-						return "std_msgs", parts[0]
-					}
-				}
-
-				// implicit package, native type
-				switch f.Type {
-				case "bool", "int8", "uint8", "int16", "uint16",
-					"int32", "uint32", "int64", "uint64", "float32",
-					"float64", "string":
-					return "", f.Type
-
-				case "time", "duration":
-					return "time", strings.Title(f.Type)
-
-				case "byte":
-					return "", "int8 `rostype:\"byte\"`"
-
-				case "char":
-					return "", "uint8 `rostype:\"char\"`"
-				}
-
-				// implicit package, other message
-				return "", f.Type
-			}()
-
-			res.Fields = append(res.Fields, f)
+			name, val := line[:i], line[i+1:]
+			name = strings.TrimRight(name, " \t")
+			val = strings.TrimLeft(val, " \t")
+			parseDefinition(rosPkgName, res, typ, name, val)
 		}
 	}
 
@@ -248,11 +257,7 @@ func ParseMessageDefinition(goPkgName string, rosPkgName, name string, content s
 
 // Write converts a message definition into a Go structure.
 func (res *MessageDefinition) Write() (string, error) {
-	buf := bytes.NewBuffer(nil)
-	err := tpl.Execute(buf, res)
-	if err != nil {
-		return "", err
-	}
-
+	var buf bytes.Buffer
+	tpl.Execute(&buf, res)
 	return buf.String(), nil
 }

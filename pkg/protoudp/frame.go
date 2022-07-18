@@ -26,7 +26,7 @@ type Frame struct {
 	Opcode       Opcode
 	MessageID    uint8
 	BlockID      uint16
-	Content      []byte
+	Payload      []byte
 }
 
 func (f *Frame) decode(byts []byte) error {
@@ -38,29 +38,29 @@ func (f *Frame) decode(byts []byte) error {
 	f.Opcode = Opcode(byts[4])
 	f.MessageID = byts[5]
 	f.BlockID = binary.LittleEndian.Uint16(byts[6:8])
-	f.Content = byts[8:]
+	f.Payload = byts[8:]
 
 	return nil
 }
 
-func (f *Frame) encode() ([]byte, error) {
-	byts := make([]byte, 8+len(f.Content))
+func (f *Frame) encode() []byte {
+	byts := make([]byte, 8+len(f.Payload))
 
 	binary.LittleEndian.PutUint32(byts[:4], f.ConnectionID)
 	byts[4] = uint8(f.Opcode)
 	byts[5] = f.MessageID
 	binary.LittleEndian.PutUint16(byts[6:8], f.BlockID)
-	copy(byts[8:], f.Content)
+	copy(byts[8:], f.Payload)
 
-	return byts, nil
+	return byts
 }
 
 // FramesForPayload generates frames for the given payload.
-func FramesForPayload(connID uint32, messageID uint8, byts []byte) []*Frame {
+func FramesForPayload(connID uint32, messageID uint8, payload []byte) []*Frame {
 	var ret []*Frame
-	lbyts := len(byts)
+	payloadSize := len(payload)
 
-	for i := 0; i < lbyts; i += maxPayloadSize {
+	for i := 0; i < payloadSize; i += maxPayloadSize {
 		f := &Frame{
 			ConnectionID: connID,
 			Opcode: func() Opcode {
@@ -73,21 +73,21 @@ func FramesForPayload(connID uint32, messageID uint8, byts []byte) []*Frame {
 			BlockID: func() uint16 {
 				// return block count
 				if i == 0 {
-					if (lbyts % maxPayloadSize) == 0 {
-						return uint16(lbyts / maxPayloadSize)
+					if (payloadSize % maxPayloadSize) == 0 {
+						return uint16(payloadSize / maxPayloadSize)
 					}
-					return uint16((lbyts / maxPayloadSize) + 1)
+					return uint16((payloadSize / maxPayloadSize) + 1)
 				}
 
 				// return current block id
 				return uint16(i / maxPayloadSize)
 			}(),
-			Content: func() []byte {
+			Payload: func() []byte {
 				j := i + maxPayloadSize
-				if j > lbyts {
-					j = lbyts
+				if j > payloadSize {
+					j = payloadSize
 				}
-				return byts[i:j]
+				return payload[i:j]
 			}(),
 		}
 		ret = append(ret, f)

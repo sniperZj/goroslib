@@ -6,6 +6,11 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
+)
+
+const (
+	serverWriteTimeout = 10 * time.Second
 )
 
 // ErrorRes is a special response that sends status code 400.
@@ -13,24 +18,13 @@ import (
 // <methodResponse><fault><value>..., a structure which would require additional parsing.
 type ErrorRes struct{}
 
-// ServerURL returns a XMLRPC server url.
-func ServerURL(address *net.TCPAddr, port int) string {
-	return (&url.URL{
-		Scheme: "http",
-		Host: (&net.TCPAddr{
-			IP:   address.IP,
-			Port: port,
-			Zone: address.Zone,
-		}).String(),
-	}).String()
-}
-
 // Server is a XML-RPC server.
 type Server struct {
 	ctx       context.Context
 	ctxCancel func()
 	wg        sync.WaitGroup
 	ln        net.Listener
+	handler   func(*RequestRaw) interface{}
 
 	// in
 	setHandler chan func(*RequestRaw) interface{}
@@ -67,48 +61,33 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// Port returns the server port.
-func (s *Server) Port() int {
-	return s.ln.Addr().(*net.TCPAddr).Port
+// URL returns the server URL.
+func (s *Server) URL(ip net.IP, zone string) string {
+	return (&url.URL{
+		Scheme: "http",
+		Host: (&net.TCPAddr{
+			IP:   ip,
+			Port: s.ln.Addr().(*net.TCPAddr).Port,
+			Zone: zone,
+		}).String(),
+	}).String()
 }
 
 func (s *Server) run() {
 	defer s.wg.Done()
 
-	var handler func(*RequestRaw) interface{}
 	select {
-	case handler = <-s.setHandler:
+	case handler := <-s.setHandler:
+		s.handler = handler
+
 	case <-s.ctx.Done():
 		s.ln.Close()
 		return
 	}
 
 	hs := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			if req.URL.Path != "/RPC2" && req.URL.Path != "/" {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			if req.Method != "POST" {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			raw, err := requestDecodeRaw(req.Body)
-			if err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			res := handler(raw)
-
-			if _, ok := res.(ErrorRes); ok {
-				w.WriteHeader(http.StatusBadRequest)
-			} else {
-				responseEncode(w, res)
-			}
-		}),
+		Handler:      s,
+		WriteTimeout: serverWriteTimeout,
 	}
 
 	s.wg.Add(1)
@@ -119,13 +98,41 @@ func (s *Server) run() {
 
 	<-s.ctx.Done()
 
-	s.ln.Close()
-
 	hs.Shutdown(context.Background())
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path != "/RPC2" && req.URL.Path != "/" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if req.Method != http.MethodPost {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	raw, err := requestDecodeRaw(req.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	res := s.handler(raw)
+
+	if _, ok := res.(ErrorRes); ok {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	responseEncode(w, res)
 }
 
 // Serve starts serving requests and waits until the server is closed.
 func (s *Server) Serve(handler func(*RequestRaw) interface{}) {
-	s.setHandler <- handler
+	select {
+	case s.setHandler <- handler:
+	case <-s.ctx.Done():
+	}
 	s.wg.Wait()
 }

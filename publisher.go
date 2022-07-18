@@ -44,17 +44,18 @@ type Publisher struct {
 	ctxCancel     func()
 	msgType       string
 	msgMd5        string
+	msgDef        string
 	subscribers   map[string]*publisherSubscriber
 	subscribersWg sync.WaitGroup
 	lastMessage   interface{}
 	id            int
 
 	// in
-	getBusInfo         chan getBusInfoSubReq
-	requestTopic       chan subscriberRequestTopicReq
-	subscriberTCPNew   chan tcpConnSubscriberReq
-	subscriberTCPClose chan *publisherSubscriber
-	write              chan interface{}
+	getBusInfo       chan getBusInfoSubReq
+	requestTopic     chan subscriberRequestTopicReq
+	subscriberTCPNew chan tcpConnSubscriberReq
+	subscriberClose  chan *publisherSubscriber
+	write            chan interface{}
 
 	// out
 	done chan struct{}
@@ -74,47 +75,53 @@ func NewPublisher(conf PublisherConf) (*Publisher, error) {
 		return nil, fmt.Errorf("Msg is empty")
 	}
 
-	msgt := reflect.TypeOf(conf.Msg)
-	if msgt.Kind() != reflect.Ptr {
-		return nil, fmt.Errorf("Msg must be a pointer")
-	}
-	if msgt.Elem().Kind() != reflect.Struct {
-		return nil, fmt.Errorf("Msg must be a pointer to a struct")
+	if reflect.TypeOf(conf.Msg).Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("Msg is not a pointer")
 	}
 
-	msgType, err := msgproc.Type(conf.Msg)
+	msgElem := reflect.ValueOf(conf.Msg).Elem().Interface()
+
+	msgType, err := msgproc.Type(msgElem)
 	if err != nil {
 		return nil, err
 	}
 
-	msgMd5, err := msgproc.MD5(conf.Msg)
+	msgMd5, err := msgproc.MD5(msgElem)
 	if err != nil {
 		return nil, err
 	}
+
+	msgDef, err := msgproc.Definition(msgElem)
+	if err != nil {
+		return nil, err
+	}
+
+	conf.Topic = conf.Node.applyCliRemapping(conf.Topic)
 
 	ctx, ctxCancel := context.WithCancel(conf.Node.ctx)
 
 	p := &Publisher{
-		conf:               conf,
-		ctx:                ctx,
-		ctxCancel:          ctxCancel,
-		msgType:            msgType,
-		msgMd5:             msgMd5,
-		subscribers:        make(map[string]*publisherSubscriber),
-		getBusInfo:         make(chan getBusInfoSubReq),
-		requestTopic:       make(chan subscriberRequestTopicReq),
-		subscriberTCPNew:   make(chan tcpConnSubscriberReq),
-		subscriberTCPClose: make(chan *publisherSubscriber),
-		write:              make(chan interface{}),
-		done:               make(chan struct{}),
+		conf:             conf,
+		ctx:              ctx,
+		ctxCancel:        ctxCancel,
+		msgType:          msgType,
+		msgMd5:           msgMd5,
+		msgDef:           msgDef,
+		subscribers:      make(map[string]*publisherSubscriber),
+		getBusInfo:       make(chan getBusInfoSubReq),
+		requestTopic:     make(chan subscriberRequestTopicReq),
+		subscriberTCPNew: make(chan tcpConnSubscriberReq),
+		subscriberClose:  make(chan *publisherSubscriber),
+		write:            make(chan interface{}),
+		done:             make(chan struct{}),
 	}
+
+	p.conf.Node.Log(LogLevelDebug, "publisher '%s' created",
+		p.conf.Node.absoluteTopicName(p.conf.Topic))
 
 	cerr := make(chan error)
 	select {
-	case conf.Node.publisherNew <- publisherNewReq{
-		pub: p,
-		err: cerr,
-	}:
+	case conf.Node.publisherNew <- publisherNewReq{pub: p, res: cerr}:
 		err = <-cerr
 		if err != nil {
 			return nil, err
@@ -133,6 +140,9 @@ func NewPublisher(conf PublisherConf) (*Publisher, error) {
 func (p *Publisher) Close() error {
 	p.ctxCancel()
 	<-p.done
+
+	p.conf.Node.Log(LogLevelDebug, "publisher '%s' destroyed",
+		p.conf.Node.absoluteTopicName(p.conf.Topic))
 	return nil
 }
 
@@ -144,17 +154,7 @@ outer:
 		select {
 		case req := <-p.getBusInfo:
 			for _, ps := range p.subscribers {
-				proto := func() string {
-					if ps.tcpClient != nil {
-						return "TCPROS"
-					}
-					return "UDPROS"
-				}()
-				*req.pbusInfo = append(*req.pbusInfo,
-					[]interface{}{
-						0, ps.callerID, "o", proto,
-						p.conf.Node.absoluteTopicName(p.conf.Topic), true,
-					})
+				*req.pbusInfo = append(*req.pbusInfo, ps.busInfo())
 			}
 			close(req.done)
 
@@ -177,13 +177,11 @@ outer:
 
 				switch protoName {
 				case "TCPROS":
-					nodeIP, _, _ := net.SplitHostPort(p.conf.Node.nodeAddr.String())
 					req.res <- apislave.ResponseRequestTopic{
-						Code:          1,
-						StatusMessage: "",
+						Code: 1,
 						Protocol: []interface{}{
 							"TCPROS",
-							nodeIP,
+							p.conf.Node.nodeAddr.IP.String(),
 							p.conf.Node.tcprosServer.Port(),
 						},
 					}
@@ -237,7 +235,7 @@ outer:
 					}
 
 					if header.Md5sum != p.msgMd5 {
-						return fmt.Errorf("wrong md5: expected '%s', got '%s'",
+						return fmt.Errorf("wrong message checksum, expected '%s', got '%s'",
 							p.msgMd5, header.Md5sum)
 					}
 
@@ -246,61 +244,26 @@ outer:
 						return fmt.Errorf("unable to solve udp address)")
 					}
 
-					// if subscriber is in localhost, send packets from localhost to localhost
-					// this avoids a bug in which the source ip is randomly chosen
-					// from all available interfaces, making ip-based filtering unpractical
-					isLocalhost := func() bool {
-						ifaces, err := net.Interfaces()
-						if err != nil {
-							return false
-						}
-
-						for _, i := range ifaces {
-							addrs, err := i.Addrs()
-							if err != nil {
-								continue
-							}
-
-							for _, addr := range addrs {
-								if v, ok := addr.(*net.IPNet); ok {
-									if v.IP.Equal(udpAddr.IP) {
-										return true
-									}
-								}
-							}
-						}
-						return false
-					}()
-
-					if isLocalhost {
-						udpAddr.IP = net.IPv4(127, 0, 0, 1)
-					}
-
-					newPublisherSubscriber(p,
+					ps := newPublisherSubscriber(p,
 						header.Callerid, nil, udpAddr)
+					p.subscribers[header.Callerid] = ps
 
 					req.res <- apislave.ResponseRequestTopic{
-						Code:          1,
-						StatusMessage: "",
+						Code: 1,
 						Protocol: []interface{}{
 							"UDPROS",
-							func() string {
-								if isLocalhost {
-									return "127.0.0.1"
-								}
-								nodeIP, _, _ := net.SplitHostPort(p.conf.Node.nodeAddr.String())
-								return nodeIP
-							}(),
+							p.conf.Node.nodeAddr.IP.String(),
 							p.conf.Node.udprosServer.Port(),
 							p.id,
 							1500,
 							func() []byte {
-								buf := bytes.NewBuffer(nil)
-								protocommon.HeaderEncode(buf, &protoudp.HeaderPublisher{
-									Callerid: p.conf.Node.absoluteName(),
-									Md5sum:   p.msgMd5,
-									Topic:    p.conf.Node.absoluteTopicName(p.conf.Topic),
-									Type:     p.msgType,
+								var buf bytes.Buffer
+								protocommon.HeaderEncode(&buf, &protoudp.HeaderPublisher{
+									Callerid:          p.conf.Node.absoluteName(),
+									Md5sum:            p.msgMd5,
+									Topic:             p.conf.Node.absoluteTopicName(p.conf.Topic),
+									Type:              p.msgType,
+									MessageDefinition: p.msgDef,
 								})
 								return buf.Bytes()[4:]
 							}(),
@@ -313,6 +276,11 @@ outer:
 				return fmt.Errorf("invalid protocol")
 			}()
 			if err != nil {
+				p.conf.Node.Log(LogLevelError,
+					"publisher '%s' can't reply to topic request: %s",
+					p.conf.Node.absoluteTopicName(p.conf.Topic),
+					err)
+
 				req.res <- apislave.ResponseRequestTopic{
 					Code:          0,
 					StatusMessage: err.Error(),
@@ -330,7 +298,7 @@ outer:
 
 				// wildcard is used by rostopic hz
 				if req.header.Md5sum != "*" && req.header.Md5sum != p.msgMd5 {
-					return fmt.Errorf("wrong md5: expected '%s', got '%s'",
+					return fmt.Errorf("wrong message checksum, expected '%s', got '%s'",
 						p.msgMd5, req.header.Md5sum)
 				}
 
@@ -345,6 +313,7 @@ outer:
 						}
 						return 0
 					}(),
+					MessageDefinition: p.msgDef,
 				})
 				if err != nil {
 					req.conn.Close()
@@ -352,19 +321,26 @@ outer:
 				}
 
 				if req.header.TcpNodelay == 0 {
-					req.conn.NetConn().SetNoDelay(false)
+					req.conn.NetConn().(*net.TCPConn).SetNoDelay(false)
 				}
 
-				newPublisherSubscriber(p,
+				ps := newPublisherSubscriber(p,
 					req.header.Callerid, req.conn, nil)
+				p.subscribers[req.header.Callerid] = ps
 
 				if p.conf.Latch && p.lastMessage != nil {
-					p.subscribers[req.header.Callerid].writeMessage(p.lastMessage)
+					ps.writeMessage(p.lastMessage)
 				}
 
 				return nil
 			}()
 			if err != nil {
+				p.conf.Node.Log(LogLevelError,
+					"publisher '%s' is unable to accept TCP subscriber '%s': %s",
+					p.conf.Node.absoluteTopicName(p.conf.Topic),
+					req.conn.NetConn().RemoteAddr(),
+					err)
+
 				req.conn.WriteHeader(&prototcp.HeaderError{
 					Error: err.Error(),
 				})
@@ -372,8 +348,8 @@ outer:
 				continue
 			}
 
-		case sub := <-p.subscriberTCPClose:
-			sub.close()
+		case ps := <-p.subscriberClose:
+			delete(p.subscribers, ps.callerID)
 
 		case msg := <-p.write:
 			if p.conf.Latch {
@@ -393,7 +369,7 @@ outer:
 
 	p.conf.Node.apiMasterClient.UnregisterPublisher(
 		p.conf.Node.absoluteTopicName(p.conf.Topic),
-		p.conf.Node.apiSlaveServerURL)
+		p.conf.Node.apiSlaveServer.URL())
 
 	p.subscribersWg.Wait()
 

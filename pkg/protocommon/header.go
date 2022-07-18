@@ -35,20 +35,66 @@ func snakeToCamel(in string) string {
 	return string(tmp)
 }
 
-// Header is an header.
-type Header interface {
-	IsHeader()
+// HeaderRaw is a raw header.
+type HeaderRaw map[string]string
+
+// HeaderRawDecode decodes a raw header in binary format.
+func HeaderRawDecode(r io.Reader) (HeaderRaw, error) {
+	raw := make(HeaderRaw)
+
+	// use a shared buffer for performance reasons
+	buf := make([]byte, 8)
+
+	// read header length
+	_, err := r.Read(buf[:4])
+	if err != nil {
+		return nil, err
+	}
+	hlen := int64(binary.LittleEndian.Uint32(buf))
+	if hlen == 0 {
+		return nil, fmt.Errorf("invalid header length")
+	}
+
+	for hlen > 0 {
+		// field length
+		err := readLimited(r, buf[:4], &hlen)
+		if err != nil {
+			return nil, err
+		}
+		flen := int64(binary.LittleEndian.Uint32(buf))
+		if flen == 0 || flen > hlen {
+			return nil, fmt.Errorf("invalid field length")
+		}
+
+		// field
+		field := make([]byte, flen)
+		err = readLimitedDoNotCheck(r, field, &hlen)
+		if err != nil {
+			return nil, err
+		}
+
+		i := bytes.IndexByte(field, '=')
+		if i < 0 {
+			return nil, fmt.Errorf("missing separator")
+		}
+
+		key := string(field[:i])
+		val := string(field[i+1:])
+
+		raw[key] = val
+	}
+
+	return raw, nil
 }
 
+// Header is an header.
+type Header interface{}
+
 // HeaderDecode decodes an header in binary format.
-func HeaderDecode(raw HeaderRaw, header Header) error {
-	// check input
-	rv := reflect.ValueOf(header)
-	if rv.Kind() != reflect.Ptr {
-		return fmt.Errorf("invalid message kind: expected ptr, got %s", rv.Kind())
-	}
-	if rv.Elem().Kind() != reflect.Struct {
-		return fmt.Errorf("invalid message kind: expected struct, got %s", rv.Kind())
+func HeaderDecode(raw HeaderRaw, dest Header) error {
+	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Struct {
+		return fmt.Errorf("dest must be a pointer to a struct")
 	}
 
 	for key, val := range raw {
@@ -59,12 +105,6 @@ func HeaderDecode(raw HeaderRaw, header Header) error {
 		if rf == zero {
 			// skip unhandled fields
 			continue
-		}
-
-		if rf.Kind() == reflect.Ptr {
-			ptr := reflect.New(rf.Type().Elem())
-			rf.Set(ptr)
-			rf = ptr.Elem()
 		}
 
 		switch rf.Kind() {
@@ -79,7 +119,7 @@ func HeaderDecode(raw HeaderRaw, header Header) error {
 			rf.SetInt(i)
 
 		default:
-			return fmt.Errorf("invalid field kind: %s", rf.Kind())
+			return fmt.Errorf("unsupported field type: %s", rf.Type())
 		}
 	}
 
@@ -87,17 +127,13 @@ func HeaderDecode(raw HeaderRaw, header Header) error {
 }
 
 // HeaderEncode encodes an header in binary format.
-func HeaderEncode(w io.Writer, header Header) error {
-	// check input
-	rv := reflect.ValueOf(header)
-	if rv.Kind() != reflect.Ptr {
-		return fmt.Errorf("invalid message kind: expected ptr, got %s", rv.Kind())
-	}
-	if rv.Elem().Kind() != reflect.Struct {
-		return fmt.Errorf("invalid message kind: expected struct, got %s", rv.Kind())
+func HeaderEncode(w io.Writer, src Header) error {
+	rv := reflect.ValueOf(src)
+	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Struct {
+		return fmt.Errorf("src must be a pointer to a struct")
 	}
 
-	// use a shared buffer for performance reasons
+	// use a shared buffer to improve performance
 	buf := make([]byte, 8)
 
 	// compute header
@@ -107,13 +143,6 @@ func HeaderEncode(w io.Writer, header Header) error {
 		key := camelToSnake(rv.Elem().Type().Field(i).Name)
 		val := rv.Elem().Field(i)
 
-		if val.Kind() == reflect.Ptr {
-			if val.IsNil() {
-				continue
-			}
-			val = val.Elem()
-		}
-
 		flen := uint32(0)
 
 		bkey := []byte(key)
@@ -122,38 +151,22 @@ func HeaderEncode(w io.Writer, header Header) error {
 		flen++
 
 		bval := func() []byte {
-			switch val.Kind() {
-			case reflect.String:
+			if val.Kind() == reflect.String {
 				return []byte(val.Interface().(string))
-
-			case reflect.Int:
-				return []byte(strconv.FormatInt(int64(val.Interface().(int)), 10))
 			}
-			return nil
+
+			// reflect.Int
+			return []byte(strconv.FormatInt(int64(val.Interface().(int)), 10))
 		}()
 		flen += uint32(len(bval))
 
 		// write field length
 		binary.LittleEndian.PutUint32(buf, flen)
-		_, err := he.Write(buf[:4])
-		if err != nil {
-			return err
-		}
+		he.Write(buf[:4])
 
-		_, err = he.Write(bkey)
-		if err != nil {
-			return err
-		}
-
-		_, err = he.Write([]byte{'='})
-		if err != nil {
-			return err
-		}
-
-		_, err = he.Write(bval)
-		if err != nil {
-			return err
-		}
+		he.Write(bkey)
+		he.Write([]byte{'='})
+		he.Write(bval)
 	}
 
 	// write header length

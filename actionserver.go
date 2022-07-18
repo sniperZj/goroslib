@@ -29,30 +29,25 @@ const (
 	ActionServerGoalStateLost       ActionServerGoalState = ActionServerGoalState(actionlib_msgs.GoalStatus_LOST)
 )
 
+var actionServerGoalStateLabels = map[ActionServerGoalState]string{
+	ActionServerGoalStatePending:    "pending",
+	ActionServerGoalStateActive:     "active",
+	ActionServerGoalStatePreempted:  "preempted",
+	ActionServerGoalStateSucceeded:  "succeeded",
+	ActionServerGoalStateAborted:    "aborted",
+	ActionServerGoalStateRejected:   "rejected",
+	ActionServerGoalStatePreempting: "preempting",
+	ActionServerGoalStateRecalling:  "recalling",
+	ActionServerGoalStateRecalled:   "recalled",
+	ActionServerGoalStateLost:       "lost",
+}
+
 // String implements fmt.Stringer.
 func (s ActionServerGoalState) String() string {
-	switch s {
-	case ActionServerGoalStatePending:
-		return "pending"
-	case ActionServerGoalStateActive:
-		return "active"
-	case ActionServerGoalStatePreempted:
-		return "preempted"
-	case ActionServerGoalStateSucceeded:
-		return "succeeded"
-	case ActionServerGoalStateAborted:
-		return "aborted"
-	case ActionServerGoalStateRejected:
-		return "rejected"
-	case ActionServerGoalStatePreempting:
-		return "preempting"
-	case ActionServerGoalStateRecalling:
-		return "recalling"
-	case ActionServerGoalStateRecalled:
-		return "recalled"
-	default:
-		return "lost"
+	if l, ok := actionServerGoalStateLabels[s]; ok {
+		return l
 	}
+	return "unknown"
 }
 
 // ActionServerGoalHandler is a goal handler of an ActionServer.
@@ -60,6 +55,8 @@ type ActionServerGoalHandler struct {
 	as      *ActionServer
 	id      string
 	created time.Time
+	ended   *time.Time
+	stamp   time.Time
 	state   ActionServerGoalState
 }
 
@@ -77,20 +74,16 @@ func (gh *ActionServerGoalHandler) PublishFeedback(fb interface{}) {
 
 	now := time.Now()
 
-	header := std_msgs.Header{
+	fbAction.Elem().FieldByName("Header").Set(reflect.ValueOf(std_msgs.Header{
 		Stamp: now,
-	}
-	fbAction.Elem().FieldByName("Header").Set(reflect.ValueOf(header))
-
-	status := actionlib_msgs.GoalStatus{
+	}))
+	fbAction.Elem().FieldByName("Status").Set(reflect.ValueOf(actionlib_msgs.GoalStatus{
 		GoalId: actionlib_msgs.GoalID{
-			Id: gh.id,
+			Id:    gh.id,
+			Stamp: gh.stamp,
 		},
 		Status: uint8(gh.state),
-		Text:   "",
-	}
-	fbAction.Elem().FieldByName("Status").Set(reflect.ValueOf(status))
-
+	}))
 	fbAction.Elem().FieldByName("Feedback").Set(reflect.ValueOf(fb).Elem())
 
 	gh.as.feedbackPub.Write(fbAction.Interface())
@@ -102,24 +95,27 @@ func (gh *ActionServerGoalHandler) publishResult(res interface{}) {
 			reflect.PtrTo(gh.as.resType), reflect.TypeOf(res)))
 	}
 
+	gh.as.conf.Node.Log(LogLevelDebug, "action server '%s' has finished goal '%s' with state '%s'",
+		gh.as.conf.Node.absoluteTopicName(gh.as.conf.Name),
+		gh.id,
+		gh.state)
+
 	resAction := reflect.New(gh.as.resActionType)
 
 	now := time.Now()
 
-	header := std_msgs.Header{
-		Stamp: now,
-	}
-	resAction.Elem().FieldByName("Header").Set(reflect.ValueOf(header))
+	gh.ended = &now
 
-	status := actionlib_msgs.GoalStatus{
+	resAction.Elem().FieldByName("Header").Set(reflect.ValueOf(std_msgs.Header{
+		Stamp: now,
+	}))
+	resAction.Elem().FieldByName("Status").Set(reflect.ValueOf(actionlib_msgs.GoalStatus{
 		GoalId: actionlib_msgs.GoalID{
-			Id: gh.id,
+			Id:    gh.id,
+			Stamp: gh.stamp,
 		},
 		Status: uint8(gh.state),
-		Text:   "",
-	}
-	resAction.Elem().FieldByName("Status").Set(reflect.ValueOf(status))
-
+	}))
 	resAction.Elem().FieldByName("Result").Set(reflect.ValueOf(res).Elem())
 
 	gh.as.resultPub.Write(resAction.Interface())
@@ -211,16 +207,17 @@ type ActionServerConf struct {
 	// It defaults to 200 ms.
 	StatusPeriod time.Duration
 
-	// (optional) goals are deleted after this duration.
+	// (optional) goals are deleted after they are finished and
+	// after this duration.
 	// It defaults to 5 secs.
-	DeleteGoalAfter time.Duration
+	DeleteFinishedGoalAfter time.Duration
 
-	// (optional) function in the form func(*ActionServerGoalHandler, *ActionGoal) that will be called
-	// whenever a goal arrives.
+	// (optional) function in the form func(*ActionServerGoalHandler, *ActionGoal)
+	// that will be called when a goal arrives.
 	OnGoal interface{}
 
-	// (optional) function in the form func(*ActionServerGoalHandler) that will be called
-	// whenever a goal cancellation request arrives.
+	// (optional) function in the form func(*ActionServerGoalHandler)
+	// that will be called when a goal cancellation request arrives.
 	OnCancel func(gh *ActionServerGoalHandler)
 }
 
@@ -262,23 +259,29 @@ func NewActionServer(conf ActionServerConf) (*ActionServer, error) {
 		return nil, fmt.Errorf("Action is empty")
 	}
 
+	if reflect.TypeOf(conf.Action).Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("Action is not a pointer")
+	}
+
 	if conf.StatusPeriod == 0 {
 		conf.StatusPeriod = 200 * time.Millisecond
 	}
 
-	if conf.DeleteGoalAfter == 0 {
-		conf.DeleteGoalAfter = 5 * time.Second
+	if conf.DeleteFinishedGoalAfter == 0 {
+		conf.DeleteFinishedGoalAfter = 5 * time.Second
 	}
 
-	goal, res, fb, err := actionproc.GoalResultFeedback(conf.Action)
+	actionElem := reflect.ValueOf(conf.Action).Elem().Interface()
+
+	goal, res, fb, err := actionproc.GoalResultFeedback(actionElem)
 	if err != nil {
 		return nil, err
 	}
 
-	goalAction, resAction, fbAction, err := actionproc.Messages(conf.Action)
-	if err != nil {
-		return nil, err
-	}
+	// Messages can't fail if GoalResultFeedback didn't fail
+	goalAction, resAction, fbAction, _ := actionproc.Messages(actionElem)
+
+	conf.Name = conf.Node.applyCliRemapping(conf.Name)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
@@ -296,16 +299,17 @@ func NewActionServer(conf ActionServerConf) (*ActionServer, error) {
 		done:           make(chan struct{}),
 	}
 
+	as.conf.Node.Log(LogLevelDebug, "action server '%s' created",
+		conf.Node.absoluteTopicName(conf.Name))
+
 	if conf.OnGoal != nil {
 		cbt := reflect.TypeOf(conf.OnGoal)
 		if cbt.Kind() != reflect.Func {
 			return nil, fmt.Errorf("OnGoal is not a function")
 		}
+
 		if cbt.NumIn() != 2 {
 			return nil, fmt.Errorf("OnGoal must accept 2 arguments")
-		}
-		if cbt.NumOut() != 0 {
-			return nil, fmt.Errorf("OnGoal must not return any value")
 		}
 		if cbt.In(0) != reflect.TypeOf(&ActionServerGoalHandler{}) {
 			return nil, fmt.Errorf("OnGoal 1st argument must be %s, while is %v",
@@ -314,6 +318,10 @@ func NewActionServer(conf ActionServerConf) (*ActionServer, error) {
 		if cbt.In(1) != reflect.PtrTo(as.goalType) {
 			return nil, fmt.Errorf("OnGoal 2nd argument must be %s, while is %v",
 				reflect.PtrTo(as.goalType), cbt.In(1))
+		}
+
+		if cbt.NumOut() != 0 {
+			return nil, fmt.Errorf("OnGoal must not return any value")
 		}
 	}
 
@@ -384,11 +392,9 @@ func NewActionServer(conf ActionServerConf) (*ActionServer, error) {
 func (as *ActionServer) Close() error {
 	as.ctxCancel()
 	<-as.done
-	as.cancelSub.Close()
-	as.goalSub.Close()
-	as.resultPub.Close()
-	as.feedbackPub.Close()
-	as.statusPub.Close()
+
+	as.conf.Node.Log(LogLevelDebug, "action server '%s' destroyed",
+		as.conf.Node.absoluteTopicName(as.conf.Name))
 	return nil
 }
 
@@ -408,10 +414,11 @@ outer:
 				as.mutex.Lock()
 				defer as.mutex.Unlock()
 
-				// remove expired goals
+				// remove ended goals
 				now := time.Now()
 				for id, gh := range as.goals {
-					if now.Sub(gh.created) >= as.conf.DeleteGoalAfter {
+					if gh.ended != nil &&
+						now.Sub(*gh.ended) >= as.conf.DeleteFinishedGoalAfter {
 						delete(as.goals, id)
 					}
 				}
@@ -420,7 +427,8 @@ outer:
 				for id, gh := range as.goals {
 					ret = append(ret, actionlib_msgs.GoalStatus{
 						GoalId: actionlib_msgs.GoalID{
-							Id: id,
+							Id:    id,
+							Stamp: gh.stamp,
 						},
 						Status: uint8(gh.state),
 					})
@@ -443,6 +451,12 @@ outer:
 	}
 
 	as.ctxCancel()
+
+	as.cancelSub.Close()
+	as.goalSub.Close()
+	as.resultPub.Close()
+	as.feedbackPub.Close()
+	as.statusPub.Close()
 }
 
 func (as *ActionServer) onGoal(in []reflect.Value) []reflect.Value {
@@ -456,6 +470,7 @@ func (as *ActionServer) onGoal(in []reflect.Value) []reflect.Value {
 		as:      as,
 		id:      goalID.Id,
 		created: time.Now(),
+		stamp:   goalID.Stamp,
 	}
 
 	func() {
@@ -465,6 +480,10 @@ func (as *ActionServer) onGoal(in []reflect.Value) []reflect.Value {
 		as.goals[goalID.Id] = gh
 	}()
 
+	as.conf.Node.Log(LogLevelDebug, "action server '%s' has a new goal '%s'",
+		as.conf.Node.absoluteTopicName(as.conf.Name),
+		goalID.Id)
+
 	if as.conf.OnGoal != nil {
 		reflect.ValueOf(as.conf.OnGoal).Call([]reflect.Value{
 			reflect.ValueOf(gh),
@@ -472,25 +491,54 @@ func (as *ActionServer) onGoal(in []reflect.Value) []reflect.Value {
 		})
 	}
 
-	return []reflect.Value{}
+	return nil
 }
 
 func (as *ActionServer) onCancel(msg *actionlib_msgs.GoalID) {
-	gh := func() *ActionServerGoalHandler {
-		as.mutex.Lock()
-		defer as.mutex.Unlock()
+	if msg.Id == "" { // cancel all goals
+		as.conf.Node.Log(LogLevelDebug, "action server '%s' is canceling all goals",
+			as.conf.Node.absoluteTopicName(as.conf.Name))
 
-		gh, ok := as.goals[msg.Id]
-		if !ok {
-			return nil
+		goals := func() []*ActionServerGoalHandler {
+			as.mutex.Lock()
+			defer as.mutex.Unlock()
+
+			var ret []*ActionServerGoalHandler
+			for _, gh := range as.goals {
+				ret = append(ret, gh)
+			}
+			return ret
+		}()
+
+		for _, gh := range goals {
+			if as.conf.OnCancel != nil {
+				as.conf.OnCancel(gh)
+			}
 		}
-		return gh
-	}()
-	if gh == nil {
-		return
-	}
+	} else { // cancel specific goal
+		gh := func() *ActionServerGoalHandler {
+			as.mutex.Lock()
+			defer as.mutex.Unlock()
 
-	if as.conf.OnCancel != nil {
-		as.conf.OnCancel(gh)
+			gh, ok := as.goals[msg.Id]
+			if !ok {
+				return nil
+			}
+			return gh
+		}()
+		if gh == nil {
+			as.conf.Node.Log(LogLevelError, "action server '%s' is unable to cancel goal '%s'",
+				as.conf.Node.absoluteTopicName(as.conf.Name),
+				msg.Id)
+			return
+		}
+
+		as.conf.Node.Log(LogLevelDebug, "action server '%s' is canceling goal '%s'",
+			as.conf.Node.absoluteTopicName(as.conf.Name),
+			msg.Id)
+
+		if as.conf.OnCancel != nil {
+			as.conf.OnCancel(gh)
+		}
 	}
 }

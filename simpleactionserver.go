@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 
 	"github.com/aler9/goroslib/pkg/actionproc"
 )
@@ -33,14 +34,16 @@ type SimpleActionServerConf struct {
 type SimpleActionServer struct {
 	conf SimpleActionServerConf
 
-	ctx           context.Context
-	ctxCancel     func()
-	as            *ActionServer
-	lastGoal      *ActionServerGoalHandler
-	executingGoal *ActionServerGoalHandler
+	ctx         context.Context
+	ctxCancel   func()
+	as          *ActionServer
+	currentGoal *ActionServerGoalHandler
+	preemptFlag bool
+	mutex       sync.Mutex
 
 	// in
-	goal chan *goalHandlerPair
+	goal   chan goalHandlerPair
+	cancel chan *ActionServerGoalHandler
 
 	// out
 	done chan struct{}
@@ -48,19 +51,26 @@ type SimpleActionServer struct {
 
 // NewSimpleActionServer allocates a SimpleActionServer.
 func NewSimpleActionServer(conf SimpleActionServerConf) (*SimpleActionServer, error) {
+	if reflect.TypeOf(conf.Action).Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("Action is not a pointer")
+	}
+
+	actionElem := reflect.ValueOf(conf.Action).Elem().Interface()
+
+	goal, _, _, err := actionproc.GoalResultFeedback(actionElem)
+	if err != nil {
+		return nil, err
+	}
+
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	sas := &SimpleActionServer{
 		conf:      conf,
 		ctx:       ctx,
 		ctxCancel: ctxCancel,
-		goal:      make(chan *goalHandlerPair),
+		goal:      make(chan goalHandlerPair),
+		cancel:    make(chan *ActionServerGoalHandler),
 		done:      make(chan struct{}),
-	}
-
-	goal, _, _, err := actionproc.GoalResultFeedback(conf.Action)
-	if err != nil {
-		return nil, err
 	}
 
 	if conf.OnExecute != nil {
@@ -68,11 +78,9 @@ func NewSimpleActionServer(conf SimpleActionServerConf) (*SimpleActionServer, er
 		if cbt.Kind() != reflect.Func {
 			return nil, fmt.Errorf("OnExecute is not a function")
 		}
+
 		if cbt.NumIn() != 2 {
 			return nil, fmt.Errorf("OnExecute must accept 2 arguments")
-		}
-		if cbt.NumOut() != 0 {
-			return nil, fmt.Errorf("OnExecute must not return any value")
 		}
 		if cbt.In(0) != reflect.TypeOf(&SimpleActionServer{}) {
 			return nil, fmt.Errorf("OnExecute 1st argument must be %s, while is %v",
@@ -81,6 +89,10 @@ func NewSimpleActionServer(conf SimpleActionServerConf) (*SimpleActionServer, er
 		if cbt.In(1) != reflect.PtrTo(reflect.TypeOf(goal)) {
 			return nil, fmt.Errorf("OnExecute 2nd argument must be %s, while is %v",
 				reflect.PtrTo(reflect.TypeOf(goal)), cbt.In(1))
+		}
+
+		if cbt.NumOut() != 0 {
+			return nil, fmt.Errorf("OnExecute must not return any value")
 		}
 	}
 
@@ -108,53 +120,53 @@ func NewSimpleActionServer(conf SimpleActionServerConf) (*SimpleActionServer, er
 
 // Close closes a SimpleActionServer.
 func (sas *SimpleActionServer) Close() error {
-	sas.as.Close()
-
-	go func() {
-		for range sas.goal {
-		}
-	}()
-
 	sas.ctxCancel()
 	<-sas.done
-
 	return nil
 }
 
+// IsPreemptRequested checks whether the goal has been canceled.
+func (sas *SimpleActionServer) IsPreemptRequested() bool {
+	sas.mutex.Lock()
+	defer sas.mutex.Unlock()
+	return sas.preemptFlag
+}
+
 // PublishFeedback publishes a feedback about the current goal.
+// This can be called only from an OnExecute callback.
 func (sas *SimpleActionServer) PublishFeedback(fb interface{}) {
-	sas.executingGoal.PublishFeedback(fb)
+	sas.currentGoal.PublishFeedback(fb)
 }
 
 // SetAborted sets the current goal as aborted.
+// This can be called only from an OnExecute callback.
 func (sas *SimpleActionServer) SetAborted(res interface{}) {
-	sas.executingGoal.SetAborted(res)
+	sas.currentGoal.SetAborted(res)
 }
 
 // SetSucceeded sets the current goal as succeeded.
+// This can be called only from an OnExecute callback.
 func (sas *SimpleActionServer) SetSucceeded(res interface{}) {
-	sas.executingGoal.SetSucceeded(res)
+	sas.currentGoal.SetSucceeded(res)
 }
 
 func (sas *SimpleActionServer) onGoal(in []reflect.Value) []reflect.Value {
 	gh := in[0].Interface().(*ActionServerGoalHandler)
 	goal := in[1].Interface()
 
-	if sas.lastGoal != nil {
-		sas.lastGoal.SetCanceled(reflect.New(sas.as.resType).Interface())
+	select {
+	case sas.goal <- goalHandlerPair{gh, goal}:
+	case <-sas.ctx.Done():
 	}
 
-	sas.lastGoal = gh
-
-	gh.SetAccepted()
-
-	sas.goal <- &goalHandlerPair{gh, goal}
-
-	return []reflect.Value{}
+	return nil
 }
 
 func (sas *SimpleActionServer) onCancel(gh *ActionServerGoalHandler) {
-	gh.SetCanceled(reflect.New(sas.as.resType).Interface())
+	select {
+	case sas.cancel <- gh:
+	case <-sas.ctx.Done():
+	}
 }
 
 func (sas *SimpleActionServer) run() {
@@ -163,39 +175,66 @@ func (sas *SimpleActionServer) run() {
 	executeRunning := false
 	var executeDone chan struct{}
 
-	executeLaunch := func(pair *goalHandlerPair) {
-		sas.executingGoal = pair.gh
-		executeRunning = true
+	executeStart := func(goal interface{}, gh *ActionServerGoalHandler, preemptFlag bool) {
+		sas.currentGoal = gh
+		sas.preemptFlag = preemptFlag
 
+		executeRunning = true
 		executeDone = make(chan struct{})
+
 		go func() {
 			defer close(executeDone)
 
 			if sas.conf.OnExecute != nil {
 				reflect.ValueOf(sas.conf.OnExecute).Call([]reflect.Value{
 					reflect.ValueOf(sas),
-					reflect.ValueOf(pair.goal),
+					reflect.ValueOf(goal),
 				})
 			}
 		}()
 	}
 
+	var lastGoal *ActionServerGoalHandler
 	var nextGoal *goalHandlerPair
+	nextGoalPreemptFlag := false
 
 outer:
 	for {
 		select {
 		case pair := <-sas.goal:
+			if lastGoal != nil {
+				lastGoal.SetCanceled(reflect.New(sas.as.resType).Interface())
+			}
+
+			lastGoal = pair.gh
+
+			pair.gh.SetAccepted()
+
 			if !executeRunning {
-				executeLaunch(pair)
+				executeStart(pair.goal, pair.gh, false)
 			} else {
-				nextGoal = pair
+				nextGoal = &pair
+				nextGoalPreemptFlag = false
+			}
+
+		case gh := <-sas.cancel:
+			switch gh {
+			case sas.currentGoal:
+				sas.mutex.Lock()
+				sas.preemptFlag = true
+				sas.mutex.Unlock()
+
+			case nextGoal.gh:
+				nextGoalPreemptFlag = true
 			}
 
 		case <-executeDone:
 			if nextGoal != nil {
-				executeLaunch(nextGoal)
+				executeStart(nextGoal.goal, nextGoal.gh, nextGoalPreemptFlag)
 				nextGoal = nil
+				nextGoalPreemptFlag = false
+			} else {
+				lastGoal = nil
 			}
 
 		case <-sas.ctx.Done():
@@ -204,4 +243,10 @@ outer:
 	}
 
 	sas.ctxCancel()
+
+	sas.as.Close()
+
+	if executeRunning {
+		<-executeDone
+	}
 }

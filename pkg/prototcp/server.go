@@ -3,35 +3,27 @@ package prototcp
 import (
 	"net"
 	"net/url"
-	"strconv"
 )
-
-// ServerURL returns the url of a PROTOTCP server.
-func ServerURL(address *net.TCPAddr, port int) string {
-	return (&url.URL{
-		Scheme: "rosrpc",
-		Host: (&net.TCPAddr{
-			IP:   address.IP,
-			Port: port,
-			Zone: address.Zone,
-		}).String(),
-	}).String()
-}
 
 // Server is a TCPROS server.
 type Server struct {
+	nodeIP   net.IP
+	nodeZone string
+
 	ln net.Listener
 }
 
 // NewServer allocates a Server.
-func NewServer(port int) (*Server, error) {
-	ln, err := net.Listen("tcp", ":"+strconv.FormatInt(int64(port), 10))
+func NewServer(address string, nodeIP net.IP, nodeZone string) (*Server, error) {
+	ln, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Server{
-		ln: ln,
+		nodeIP:   nodeIP,
+		nodeZone: nodeZone,
+		ln:       ln,
 	}, nil
 }
 
@@ -45,6 +37,18 @@ func (s *Server) Port() int {
 	return s.ln.Addr().(*net.TCPAddr).Port
 }
 
+// URL returns the server URL.
+func (s *Server) URL() string {
+	return (&url.URL{
+		Scheme: "rosrpc",
+		Host: (&net.TCPAddr{
+			IP:   s.nodeIP,
+			Port: s.Port(),
+			Zone: s.nodeZone,
+		}).String(),
+	}).String()
+}
+
 // Accept accepts clients.
 func (s *Server) Accept() (*Conn, error) {
 	nconn, err := s.ln.Accept()
@@ -52,5 +56,5 @@ func (s *Server) Accept() (*Conn, error) {
 		return nil, err
 	}
 
-	return NewConn(nconn.(*net.TCPConn)), err
+	return newConn(nconn), err
 }

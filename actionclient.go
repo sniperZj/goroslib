@@ -29,28 +29,24 @@ const (
 	ActionClientCommStateLost
 )
 
+var actionClientLabels = map[ActionClientCommState]string{
+	ActionClientCommStateWaitingForGoalAck:   "waitingForGoalAck",
+	ActionClientCommStatePending:             "pending",
+	ActionClientCommStateActive:              "active",
+	ActionClientCommStateWaitingForResult:    "waitingForResult",
+	ActionClientCommStateWaitingForCancelAck: "waitingForCancelAck",
+	ActionClientCommStateRecalling:           "recalling",
+	ActionClientCommStatePreempting:          "preempting",
+	ActionClientCommStateDone:                "done",
+	ActionClientCommStateLost:                "lost",
+}
+
 // String implements fmt.Stringer.
 func (s ActionClientCommState) String() string {
-	switch s {
-	case ActionClientCommStateWaitingForGoalAck:
-		return "waitingForGoalAck"
-	case ActionClientCommStatePending:
-		return "pending"
-	case ActionClientCommStateActive:
-		return "active"
-	case ActionClientCommStateWaitingForResult:
-		return "waitingForResult"
-	case ActionClientCommStateWaitingForCancelAck:
-		return "waitingForCancelAck"
-	case ActionClientCommStateRecalling:
-		return "recalling"
-	case ActionClientCommStatePreempting:
-		return "preempting"
-	case ActionClientCommStateDone:
-		return "done"
-	default:
-		return "lost"
+	if l, ok := actionClientLabels[s]; ok {
+		return l
 	}
+	return "unknown"
 }
 
 // ActionClientTerminalState is the terminal state of the goal of an action client.
@@ -58,30 +54,35 @@ type ActionClientTerminalState int
 
 // standard goal terminal states.
 const (
-	ActionClientTerminalStateRecalled  ActionClientTerminalState = ActionClientTerminalState(actionlib_msgs.GoalStatus_RECALLED)
-	ActionClientTerminalStateRejected  ActionClientTerminalState = ActionClientTerminalState(actionlib_msgs.GoalStatus_REJECTED)
-	ActionClientTerminalStatePreempted ActionClientTerminalState = ActionClientTerminalState(actionlib_msgs.GoalStatus_PREEMPTED)
-	ActionClientTerminalStateAborted   ActionClientTerminalState = ActionClientTerminalState(actionlib_msgs.GoalStatus_ABORTED)
-	ActionClientTerminalStateSucceeded ActionClientTerminalState = ActionClientTerminalState(actionlib_msgs.GoalStatus_SUCCEEDED)
-	ActionClientTerminalStateLost      ActionClientTerminalState = ActionClientTerminalState(actionlib_msgs.GoalStatus_LOST)
+	ActionClientTerminalStateRecalled ActionClientTerminalState = ActionClientTerminalState(
+		actionlib_msgs.GoalStatus_RECALLED)
+	ActionClientTerminalStateRejected ActionClientTerminalState = ActionClientTerminalState(
+		actionlib_msgs.GoalStatus_REJECTED)
+	ActionClientTerminalStatePreempted ActionClientTerminalState = ActionClientTerminalState(
+		actionlib_msgs.GoalStatus_PREEMPTED)
+	ActionClientTerminalStateAborted ActionClientTerminalState = ActionClientTerminalState(
+		actionlib_msgs.GoalStatus_ABORTED)
+	ActionClientTerminalStateSucceeded ActionClientTerminalState = ActionClientTerminalState(
+		actionlib_msgs.GoalStatus_SUCCEEDED)
+	ActionClientTerminalStateLost ActionClientTerminalState = ActionClientTerminalState(
+		actionlib_msgs.GoalStatus_LOST)
 )
+
+var actionClientTerminalStateLabels = map[ActionClientTerminalState]string{
+	ActionClientTerminalStateRecalled:  "recalled",
+	ActionClientTerminalStateRejected:  "rejected",
+	ActionClientTerminalStatePreempted: "preempted",
+	ActionClientTerminalStateAborted:   "aborted",
+	ActionClientTerminalStateSucceeded: "succeeded",
+	ActionClientTerminalStateLost:      "lost",
+}
 
 // String implements fmt.Stringer.
 func (s ActionClientTerminalState) String() string {
-	switch s {
-	case ActionClientTerminalStateRecalled:
-		return "recalled"
-	case ActionClientTerminalStateRejected:
-		return "rejected"
-	case ActionClientTerminalStatePreempted:
-		return "preempted"
-	case ActionClientTerminalStateAborted:
-		return "aborted"
-	case ActionClientTerminalStateSucceeded:
-		return "succeeded"
-	default:
-		return "lost"
+	if l, ok := actionClientTerminalStateLabels[s]; ok {
+		return l
 	}
+	return "unknown"
 }
 
 // ActionClientGoalConf is the configuration of SendGoal().
@@ -138,7 +139,7 @@ func (gh *ActionClientGoalHandler) Cancel() {
 	}
 }
 
-func findStatus(statusList []actionlib_msgs.GoalStatus, id string) (uint8, bool) {
+func findStatusByID(statusList []actionlib_msgs.GoalStatus, id string) (uint8, bool) {
 	for _, sta := range statusList {
 		if sta.GoalId.Id == id {
 			return sta.Status, true
@@ -147,28 +148,10 @@ func findStatus(statusList []actionlib_msgs.GoalStatus, id string) (uint8, bool)
 	return 0, false
 }
 
-func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStatus) bool {
-	if gh.commState == ActionClientCommStateDone {
-		return false
-	}
-
-	goalStatus, ok := findStatus(statusList, gh.id)
-	if !ok {
-		switch gh.commState {
-		case ActionClientCommStateWaitingForGoalAck,
-			ActionClientCommStateWaitingForResult:
-			return true
-
-		default:
-			gh.terminalState = ActionClientTerminalStateLost
-			gh.transitionTo(ActionClientCommStateDone)
-			return false
-		}
-	}
-
+func (gh *ActionClientGoalHandler) onStatus(status uint8) {
 	switch gh.commState {
 	case ActionClientCommStateWaitingForGoalAck:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 			gh.transitionTo(ActionClientCommStatePending)
 		case actionlib_msgs.GoalStatus_ACTIVE:
@@ -198,7 +181,7 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		}
 
 	case ActionClientCommStatePending:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 		case actionlib_msgs.GoalStatus_ACTIVE:
 			gh.transitionTo(ActionClientCommStateActive)
@@ -225,7 +208,7 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		}
 
 	case ActionClientCommStateActive:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 		case actionlib_msgs.GoalStatus_ACTIVE:
 		case actionlib_msgs.GoalStatus_REJECTED:
@@ -243,7 +226,7 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		}
 
 	case ActionClientCommStateWaitingForResult:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 		case actionlib_msgs.GoalStatus_ACTIVE:
 		case actionlib_msgs.GoalStatus_REJECTED:
@@ -256,7 +239,7 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		}
 
 	case ActionClientCommStateWaitingForCancelAck:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 		case actionlib_msgs.GoalStatus_ACTIVE:
 		case actionlib_msgs.GoalStatus_REJECTED:
@@ -280,7 +263,7 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		}
 
 	case ActionClientCommStateRecalling:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 		case actionlib_msgs.GoalStatus_ACTIVE:
 		case actionlib_msgs.GoalStatus_REJECTED:
@@ -302,7 +285,7 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		}
 
 	case ActionClientCommStatePreempting:
-		switch goalStatus {
+		switch status {
 		case actionlib_msgs.GoalStatus_PENDING:
 		case actionlib_msgs.GoalStatus_ACTIVE:
 		case actionlib_msgs.GoalStatus_REJECTED:
@@ -317,8 +300,6 @@ func (gh *ActionClientGoalHandler) onStatus(statusList []actionlib_msgs.GoalStat
 		case actionlib_msgs.GoalStatus_PREEMPTING:
 		}
 	}
-
-	return true
 }
 
 func (gh *ActionClientGoalHandler) onFeedback(fbAction reflect.Value) {
@@ -419,15 +400,21 @@ func NewActionClient(conf ActionClientConf) (*ActionClient, error) {
 		return nil, fmt.Errorf("Action is empty")
 	}
 
-	goal, res, fb, err := actionproc.GoalResultFeedback(conf.Action)
+	if reflect.TypeOf(conf.Action).Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("Action is not a pointer")
+	}
+
+	actionElem := reflect.ValueOf(conf.Action).Elem().Interface()
+
+	goal, res, fb, err := actionproc.GoalResultFeedback(actionElem)
 	if err != nil {
 		return nil, err
 	}
 
-	goalAction, resAction, fbAction, err := actionproc.Messages(conf.Action)
-	if err != nil {
-		return nil, err
-	}
+	// Messages can't fail if GoalResultFeedback didn't fail
+	goalAction, resAction, fbAction, _ := actionproc.Messages(actionElem)
+
+	conf.Name = conf.Node.applyCliRemapping(conf.Name)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
@@ -449,10 +436,21 @@ func NewActionClient(conf ActionClientConf) (*ActionClient, error) {
 		cancelPubOk:    make(chan struct{}),
 	}
 
+	ac.conf.Node.Log(LogLevelDebug, "action client '%s' created",
+		ac.conf.Node.absoluteTopicName(ac.conf.Name))
+
 	ac.statusSub, err = NewSubscriber(SubscriberConf{
 		Node:     conf.Node,
 		Topic:    conf.Name + "/status",
 		Callback: ac.onStatus,
+		onPublisher: func() {
+			select {
+			case <-ac.statusSubOk:
+				return
+			default:
+			}
+			close(ac.statusSubOk)
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -553,6 +551,9 @@ func (ac *ActionClient) Close() error {
 	ac.resultSub.Close()
 	ac.feedbackSub.Close()
 	ac.statusSub.Close()
+
+	ac.conf.Node.Log(LogLevelDebug, "action client '%s' destroyed",
+		ac.conf.Node.absoluteTopicName(ac.conf.Name))
 	return nil
 }
 
@@ -599,15 +600,17 @@ func (ac *ActionClient) SendGoal(conf ActionClientGoalConf) (*ActionClientGoalHa
 		if cbt.Kind() != reflect.Func {
 			return nil, fmt.Errorf("OnTransition is not a function")
 		}
+
 		if cbt.NumIn() != 2 {
 			return nil, fmt.Errorf("OnTransition must accept 2 arguments")
-		}
-		if cbt.NumOut() != 0 {
-			return nil, fmt.Errorf("OnTransition must not return any value")
 		}
 		if cbt.In(0) != reflect.TypeOf(&ActionClientGoalHandler{}) {
 			return nil, fmt.Errorf("OnTransition 1st argument must be %s, while is %v",
 				reflect.TypeOf(&ActionClientGoalHandler{}), cbt.In(0))
+		}
+
+		if cbt.NumOut() != 0 {
+			return nil, fmt.Errorf("OnTransition must not return any value")
 		}
 		if cbt.In(1) != reflect.PtrTo(ac.resType) {
 			return nil, fmt.Errorf("OnTransition 2nd argument must be %s, while is %v",
@@ -644,7 +647,8 @@ func (ac *ActionClient) SendGoal(conf ActionClientGoalConf) (*ActionClientGoalHa
 	goalID := actionlib_msgs.GoalID{
 		Stamp: now,
 		Id: func() string {
-			// https://github.com/ros/actionlib/blob/c3b2bd84f07ff54c36033c92861d3b63b7420590/actionlib/src/actionlib/goal_id_generator.py#L62
+			// https://github.com/ros/actionlib/blob/c3b2bd84f07ff54c36033c92861d3b63b7420590
+			// /actionlib/src/actionlib/goal_id_generator.py#L62
 			ss := ac.conf.Node.absoluteName() + "-"
 			ac.goalCount++
 			ss += strconv.FormatInt(int64(ac.goalCount), 10) + "-"
@@ -674,25 +678,48 @@ func (ac *ActionClient) SendGoal(conf ActionClientGoalConf) (*ActionClientGoalHa
 	return gh, nil
 }
 
-func (ac *ActionClient) onStatus(msg *actionlib_msgs.GoalStatusArray) {
-	func() {
-		ac.mutex.Lock()
-		defer ac.mutex.Unlock()
+// CancelAllGoals cancels all goals running on the server.
+func (ac *ActionClient) CancelAllGoals() {
+	ac.cancelPub.Write(&actionlib_msgs.GoalID{
+		Id: "",
+	})
+}
 
-		for id, gh := range ac.goals {
-			ok := gh.onStatus(msg.StatusList)
-			if !ok {
+func (ac *ActionClient) onStatus(msg *actionlib_msgs.GoalStatusArray) {
+	ac.mutex.Lock()
+	defer ac.mutex.Unlock()
+
+	// ref
+	// https://github.com/ros/actionlib/blob/noetic-devel/actionlib/src/actionlib/action_client.py#L332
+
+	for id, gh := range ac.goals {
+		// delete goals in "done" state
+		if gh.commState == ActionClientCommStateDone {
+			delete(ac.goals, id)
+			continue
+		}
+
+		status, ok := findStatusByID(msg.StatusList, id)
+
+		// goal not found inside status list
+		if !ok {
+			switch gh.commState {
+			// goal is still waiting to be created on the server
+			case ActionClientCommStateWaitingForGoalAck,
+				ActionClientCommStateWaitingForResult:
+				continue
+
+			// goal doesn't exist on the server, delete it
+			default:
+				gh.terminalState = ActionClientTerminalStateLost
+				gh.transitionTo(ActionClientCommStateDone)
 				delete(ac.goals, id)
+				continue
 			}
 		}
-	}()
 
-	select {
-	case <-ac.statusSubOk:
-		return
-	default:
+		gh.onStatus(status)
 	}
-	close(ac.statusSubOk)
 }
 
 func (ac *ActionClient) onFeedback(in []reflect.Value) []reflect.Value {
@@ -706,12 +733,14 @@ func (ac *ActionClient) onFeedback(in []reflect.Value) []reflect.Value {
 
 	gh, ok := ac.goals[goalStatus.GoalId.Id]
 	if !ok {
-		return []reflect.Value{}
+		return nil
 	}
+
+	gh.onStatus(goalStatus.Status)
 
 	gh.onFeedback(fbAction)
 
-	return []reflect.Value{}
+	return nil
 }
 
 func (ac *ActionClient) onResult(in []reflect.Value) []reflect.Value {
@@ -725,13 +754,15 @@ func (ac *ActionClient) onResult(in []reflect.Value) []reflect.Value {
 
 	gh, ok := ac.goals[goalStatus.GoalId.Id]
 	if !ok {
-		return []reflect.Value{}
+		return nil
 	}
+
+	gh.onStatus(goalStatus.Status)
 
 	ok = gh.onResult(resAction)
 	if !ok {
 		delete(ac.goals, goalStatus.GoalId.Id)
 	}
 
-	return []reflect.Value{}
+	return nil
 }

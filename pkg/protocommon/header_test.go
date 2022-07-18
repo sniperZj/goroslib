@@ -2,6 +2,8 @@ package protocommon
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"reflect"
 	"testing"
 
@@ -14,10 +16,8 @@ type headerSubscriber struct {
 	Type              string
 	Md5sum            string
 	MessageDefinition string
-	TcpNodelay        int //nolint:golint
+	TcpNodelay        int //nolint:revive
 }
-
-func (*headerSubscriber) IsHeader() {}
 
 type headerPublisher struct {
 	Topic    string
@@ -27,13 +27,17 @@ type headerPublisher struct {
 	Latching int
 }
 
-func (*headerPublisher) IsHeader() {}
-
 type headerError struct {
 	Error string
 }
 
-func (*headerError) IsHeader() {}
+type headerTest1 struct {
+	A float64
+}
+
+type headerTest2 struct {
+	A int
+}
 
 var casesHeader = []struct {
 	name   string
@@ -97,12 +101,107 @@ var casesHeader = []struct {
 func TestHeaderDecode(t *testing.T) {
 	for _, ca := range casesHeader {
 		t.Run(ca.name, func(t *testing.T) {
-			header := reflect.New(reflect.TypeOf(ca.header).Elem()).Interface().(Header)
 			raw, err := HeaderRawDecode(bytes.NewBuffer(ca.byts))
 			require.NoError(t, err)
+			header := reflect.New(reflect.TypeOf(ca.header).Elem()).Interface().(Header)
 			err = HeaderDecode(raw, header)
 			require.NoError(t, err)
 			require.Equal(t, ca.header, header)
+		})
+	}
+}
+
+func TestHeaderDecodeUnhandledField(t *testing.T) {
+	raw, err := HeaderRawDecode(bytes.NewBuffer([]byte{
+		0x19, 0x00, 0x00, 0x00,
+		0x0A, 0x00, 0x00, 0x00,
+		'e', 'r', 'r', 'o', 'r', '=', 't', 'e', 's', 't',
+		0x07, 0x00, 0x00, 0x00,
+		'o', 't', 'h', 'e', 'r', '=', 'k',
+	}))
+	require.NoError(t, err)
+
+	header := reflect.New(reflect.TypeOf(&headerError{
+		Error: ("test"),
+	}).Elem()).Interface().(Header)
+
+	err = HeaderDecode(raw, header)
+	require.NoError(t, err)
+	require.Equal(t, &headerError{
+		Error: ("test"),
+	}, header)
+}
+
+func TestHeaderDecodeErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name   string
+		byts   []byte
+		header Header
+		err    string
+	}{
+		{
+			"length missing",
+			[]byte{},
+			nil,
+			"EOF",
+		},
+		{
+			"length invalid",
+			[]byte{0x00, 0x00, 0x00, 0x00},
+			nil,
+			"invalid header length",
+		},
+		{
+			"field length missing",
+			[]byte{0x04, 0x00, 0x00, 0x00},
+			nil,
+			"EOF",
+		},
+		{
+			"field length invalid",
+			[]byte{0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00},
+			nil,
+			"invalid field length",
+		},
+		{
+			"field missing",
+			[]byte{0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00},
+			nil,
+			"EOF",
+		},
+		{
+			"field invalid",
+			[]byte{0x05, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 'a'},
+			nil,
+			"missing separator",
+		},
+		{
+			"dest not pointer to struct",
+			[]byte{0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 'a', '=', 'b', 'c'},
+			nil,
+			"dest must be a pointer to a struct",
+		},
+		{
+			"unsupported field type",
+			[]byte{0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 'a', '=', 'b', 'c'},
+			&headerTest1{},
+			"unsupported field type: float64",
+		},
+		{
+			"invalid integer",
+			[]byte{0x08, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 'a', '=', 'b', 'c'},
+			&headerTest2{},
+			"strconv.ParseInt: parsing \"bc\": invalid syntax",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			raw, err := HeaderRawDecode(bytes.NewBuffer(ca.byts))
+			if err != nil {
+				require.EqualError(t, err, ca.err)
+			} else {
+				err = HeaderDecode(raw, ca.header)
+				require.EqualError(t, err, ca.err)
+			}
 		})
 	}
 }
@@ -114,6 +213,52 @@ func TestHeaderEncode(t *testing.T) {
 			err := HeaderEncode(&buf, ca.header)
 			require.NoError(t, err)
 			require.Equal(t, ca.byts, buf.Bytes())
+		})
+	}
+}
+
+type limitedBuffer struct {
+	cap int
+	n   int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.n += len(p)
+	if b.n > b.cap {
+		return 0, fmt.Errorf("capacity reached")
+	}
+	return len(p), nil
+}
+
+func TestHeaderEncodeErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name   string
+		header Header
+		dest   io.Writer
+		err    string
+	}{
+		{
+			"src not pointer to struct",
+			nil,
+			nil,
+			"src must be a pointer to a struct",
+		},
+		{
+			"write error",
+			&headerPublisher{
+				Callerid: "/testing_1_2_3",
+				Md5sum:   "6a62c6daae1as3f4ff57a132d6f95cec2",
+				Topic:    "/test_topic",
+				Type:     "testlib/Msg",
+				Latching: 0,
+			},
+			&limitedBuffer{cap: 0},
+			"capacity reached",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			err := HeaderEncode(ca.dest, ca.header)
+			require.EqualError(t, err, ca.err)
 		})
 	}
 }

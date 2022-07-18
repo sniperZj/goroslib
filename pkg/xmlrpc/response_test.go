@@ -2,6 +2,7 @@ package xmlrpc
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"testing"
 
@@ -72,6 +73,85 @@ func TestResponseDecode(t *testing.T) {
 	}
 }
 
+func TestResponseDecodeErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name string
+		enc  []byte
+		dest interface{}
+		err  string
+	}{
+		{
+			"empty",
+			[]byte(""),
+			nil,
+			"EOF",
+		},
+		{
+			"missing processing instruction",
+			[]byte(`<othertag>`),
+			nil,
+			"expected xml.ProcInst, got xml.StartElement",
+		},
+		{
+			"missing method response",
+			[]byte(`<?xml version="1.0"?>`),
+			nil,
+			"EOF",
+		},
+		{
+			"missing params",
+			[]byte(`<?xml version="1.0"?><methodResponse>`),
+			nil,
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing param",
+			[]byte(`<?xml version="1.0"?><methodResponse><params>`),
+			nil,
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing value",
+			[]byte(`<?xml version="1.0"?><methodResponse><params><param>`),
+			nil,
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing array",
+			[]byte(`<?xml version="1.0"?><methodResponse><params><param><value>`),
+			nil,
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing data",
+			[]byte(`<?xml version="1.0"?><methodResponse><params><param><value><array>`),
+			nil,
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"missing value",
+			[]byte(`<?xml version="1.0"?><methodResponse><params><param><value><array><data>`),
+			&struct {
+				A string
+			}{},
+			"XML syntax error on line 1: unexpected EOF",
+		},
+		{
+			"invalid value",
+			[]byte(`<?xml version="1.0"?><methodResponse><params><param><value><array><data><value>asd`),
+			&struct {
+				A string
+			}{},
+			"XML syntax error on line 1: unexpected EOF",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			err := responseDecode(bytes.NewReader(ca.enc), ca.dest)
+			require.EqualError(t, err, ca.err)
+		})
+	}
+}
+
 func TestResponseEncode(t *testing.T) {
 	for _, ca := range casesResponse {
 		t.Run(ca.name, func(t *testing.T) {
@@ -79,6 +159,41 @@ func TestResponseEncode(t *testing.T) {
 			err := responseEncode(&buf, ca.params)
 			require.NoError(t, err)
 			require.Equal(t, ca.benc, buf.Bytes())
+		})
+	}
+}
+
+func TestResponseEncodeErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name   string
+		params interface{}
+		dest   io.Writer
+		err    string
+	}{
+		{
+			"open tag write error",
+			nil,
+			&limitedBuffer{cap: 10},
+			"capacity reached",
+		},
+		{
+			"close tag write error",
+			struct{}{},
+			&limitedBuffer{cap: 80},
+			"capacity reached",
+		},
+		{
+			"field write error",
+			struct {
+				Param string
+			}{"testing"},
+			&limitedBuffer{cap: 80},
+			"capacity reached",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			err := responseEncode(ca.dest, ca.params)
+			require.EqualError(t, err, ca.err)
 		})
 	}
 }

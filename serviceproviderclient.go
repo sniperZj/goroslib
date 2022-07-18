@@ -17,7 +17,11 @@ type serviceProviderClient struct {
 	ctxCancel func()
 }
 
-func newServiceProviderClient(sp *ServiceProvider, callerID string, conn *prototcp.Conn) {
+func newServiceProviderClient(
+	sp *ServiceProvider,
+	callerID string,
+	conn *prototcp.Conn,
+) *serviceProviderClient {
 	ctx, ctxCancel := context.WithCancel(sp.ctx)
 
 	spc := &serviceProviderClient{
@@ -28,15 +32,14 @@ func newServiceProviderClient(sp *ServiceProvider, callerID string, conn *protot
 		ctxCancel: ctxCancel,
 	}
 
-	sp.clients[callerID] = spc
+	if sp.conf.onClient != nil {
+		sp.conf.onClient()
+	}
 
 	sp.clientsWg.Add(1)
 	go spc.run()
-}
 
-func (spc *serviceProviderClient) close() {
-	delete(spc.sp.clients, spc.callerID)
-	spc.ctxCancel()
+	return spc
 }
 
 func (spc *serviceProviderClient) run() {
@@ -47,15 +50,15 @@ func (spc *serviceProviderClient) run() {
 		readErr <- func() error {
 			for {
 				req := reflect.New(reflect.TypeOf(spc.sp.srvReq)).Interface()
-				err := spc.conn.ReadMessage(req)
+				err := spc.conn.ReadMessage(req, false)
 				if err != nil {
 					return err
 				}
 
 				select {
 				case spc.sp.clientRequest <- serviceProviderClientRequestReq{
-					callerID: spc.callerID,
-					req:      req,
+					spc: spc,
+					req: req,
 				}:
 				case <-spc.sp.ctx.Done():
 					return fmt.Errorf("terminated")

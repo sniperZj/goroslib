@@ -3,7 +3,6 @@ package goroslib
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"reflect"
 	"sync"
 
@@ -29,8 +28,8 @@ type SubscriberConf struct {
 	// name of the topic from which messages will be read.
 	Topic string
 
-	// function in the form func(msg *NameOfMessage) that will be called
-	// whenever a message arrives.
+	// function in the form func(msg *NameOfMessage)
+	// that will be called when a message arrives.
 	Callback interface{}
 
 	// (optional) protocol that will be used to receive messages
@@ -63,6 +62,7 @@ type Subscriber struct {
 	msgMsg       reflect.Type
 	msgType      string
 	msgMd5       string
+	msgDef       string
 	publishers   map[string]*subscriberPublisher
 	publishersWg sync.WaitGroup
 
@@ -86,33 +86,40 @@ func NewSubscriber(conf SubscriberConf) (*Subscriber, error) {
 	}
 
 	cbt := reflect.TypeOf(conf.Callback)
-	if cbt.Kind() != reflect.Func {
+	if cbt == nil || cbt.Kind() != reflect.Func {
 		return nil, fmt.Errorf("Callback is not a function")
 	}
+
 	if cbt.NumIn() != 1 {
 		return nil, fmt.Errorf("Callback must accept a single argument")
 	}
+
 	if cbt.NumOut() != 0 {
 		return nil, fmt.Errorf("Callback must not return any value")
 	}
 
-	msgMsg := cbt.In(0)
-	if msgMsg.Kind() != reflect.Ptr {
-		return nil, fmt.Errorf("Message must be a pointer")
-	}
-	if msgMsg.Elem().Kind() != reflect.Struct {
-		return nil, fmt.Errorf("Message must be a pointer to a struct")
+	if cbt.In(0).Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("Msg is not a pointer")
 	}
 
-	msgType, err := msgproc.Type(reflect.New(msgMsg.Elem()).Interface())
+	msgElem := reflect.New(cbt.In(0).Elem()).Elem().Interface()
+
+	msgType, err := msgproc.Type(msgElem)
 	if err != nil {
 		return nil, err
 	}
 
-	msgMd5, err := msgproc.MD5(reflect.New(msgMsg.Elem()).Interface())
+	msgMd5, err := msgproc.MD5(msgElem)
 	if err != nil {
 		return nil, err
 	}
+
+	msgDef, err := msgproc.Definition(msgElem)
+	if err != nil {
+		return nil, err
+	}
+
+	conf.Topic = conf.Node.applyCliRemapping(conf.Topic)
 
 	ctx, ctxCancel := context.WithCancel(conf.Node.ctx)
 
@@ -120,9 +127,10 @@ func NewSubscriber(conf SubscriberConf) (*Subscriber, error) {
 		conf:                conf,
 		ctx:                 ctx,
 		ctxCancel:           ctxCancel,
-		msgMsg:              msgMsg.Elem(),
+		msgMsg:              cbt.In(0).Elem(),
 		msgType:             msgType,
 		msgMd5:              msgMd5,
+		msgDef:              msgDef,
 		publishers:          make(map[string]*subscriberPublisher),
 		getBusInfo:          make(chan getBusInfoSubReq),
 		subscriberPubUpdate: make(chan []string),
@@ -130,12 +138,12 @@ func NewSubscriber(conf SubscriberConf) (*Subscriber, error) {
 		done:                make(chan struct{}),
 	}
 
+	s.conf.Node.Log(LogLevelDebug, "subscriber '%s' created",
+		s.conf.Node.absoluteTopicName(s.conf.Topic))
+
 	cerr := make(chan error)
 	select {
-	case conf.Node.subscriberNew <- subscriberNewReq{
-		sub: s,
-		err: cerr,
-	}:
+	case conf.Node.subscriberNew <- subscriberNewReq{sub: s, res: cerr}:
 		err = <-cerr
 		if err != nil {
 			return nil, err
@@ -154,6 +162,9 @@ func NewSubscriber(conf SubscriberConf) (*Subscriber, error) {
 func (s *Subscriber) Close() error {
 	s.ctxCancel()
 	<-s.done
+
+	s.conf.Node.Log(LogLevelDebug, "subscriber '%s' destroyed",
+		s.conf.Node.absoluteTopicName(s.conf.Topic))
 	return nil
 }
 
@@ -181,24 +192,8 @@ outer:
 	for {
 		select {
 		case req := <-s.getBusInfo:
-			proto := func() string {
-				if s.conf.Protocol == UDP {
-					return "UDPROS"
-				}
-				return "TCPROS"
-			}()
-
-			for _, ps := range s.publishers {
-				ur := (&url.URL{
-					Scheme: "http",
-					Host:   ps.address,
-					Path:   "/",
-				}).String()
-				*req.pbusInfo = append(*req.pbusInfo,
-					[]interface{}{
-						0, ur, "i", proto,
-						s.conf.Node.absoluteTopicName(s.conf.Topic), true,
-					})
+			for _, sp := range s.publishers {
+				*req.pbusInfo = append(*req.pbusInfo, sp.busInfo())
 			}
 			close(req.done)
 
@@ -219,14 +214,16 @@ outer:
 				validPublishers[addr] = struct{}{}
 
 				if _, ok := s.publishers[addr]; !ok {
-					newSubscriberPublisher(s, addr)
+					sp := newSubscriberPublisher(s, addr)
+					s.publishers[addr] = sp
 				}
 			}
 
 			// remove outdated publishers
-			for addr, pub := range s.publishers {
+			for addr, sp := range s.publishers {
 				if _, ok := validPublishers[addr]; !ok {
-					pub.close()
+					delete(s.publishers, sp.address)
+					sp.close()
 				}
 			}
 
@@ -239,7 +236,7 @@ outer:
 
 	s.conf.Node.apiMasterClient.UnregisterSubscriber(
 		s.conf.Node.absoluteTopicName(s.conf.Topic),
-		s.conf.Node.apiSlaveServerURL)
+		s.conf.Node.apiSlaveServer.URL())
 
 	s.publishersWg.Wait()
 

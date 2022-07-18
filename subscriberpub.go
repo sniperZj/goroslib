@@ -3,9 +3,10 @@ package goroslib
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/url"
 	"reflect"
 	"strconv"
 	"time"
@@ -16,22 +17,58 @@ import (
 	"github.com/aler9/goroslib/pkg/protoudp"
 )
 
-var errSubscriberPubTerminate = errors.New("subscriberPublisher terminated")
+const (
+	subscriberPubRestartPause = 5 * time.Second
+)
+
+type localIPs map[string]struct{}
+
+func loadLocalIPs() localIPs {
+	ret := make(localIPs)
+
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, i := range ifaces {
+			addrs, err := i.Addrs()
+			if err != nil {
+				continue
+			}
+
+			for _, addr := range addrs {
+				if v, ok := addr.(*net.IPNet); ok {
+					ret[v.IP.String()] = struct{}{}
+				}
+			}
+		}
+	}
+
+	return ret
+}
+
+func (l localIPs) contains(ip net.IP) bool {
+	_, ok := l[ip.String()]
+	return ok
+}
 
 type subscriberPublisher struct {
 	sub     *Subscriber
 	address string
 
-	ctx       context.Context
-	ctxCancel func()
-	udpAddr   *net.UDPAddr
-	udpID     uint32
+	ctx            context.Context
+	ctxCancel      func()
+	localIPs       localIPs
+	udpAddrIsLocal bool
+	udpAddr        *net.UDPAddr
+	udpID          uint32
 
 	// in
 	udpFrame chan *protoudp.Frame
 }
 
-func newSubscriberPublisher(sub *Subscriber, address string) {
+func newSubscriberPublisher(
+	sub *Subscriber,
+	address string,
+) *subscriberPublisher {
 	ctx, ctxCancel := context.WithCancel(sub.ctx)
 
 	sp := &subscriberPublisher{
@@ -41,52 +78,63 @@ func newSubscriberPublisher(sub *Subscriber, address string) {
 		ctxCancel: ctxCancel,
 	}
 
-	sub.publishers[address] = sp
-
 	sub.publishersWg.Add(1)
 	go sp.run()
+
+	return sp
 }
 
 func (sp *subscriberPublisher) close() {
-	delete(sp.sub.publishers, sp.address)
 	sp.ctxCancel()
 }
 
 func (sp *subscriberPublisher) run() {
 	defer sp.sub.publishersWg.Done()
 
+	sp.sub.conf.Node.Log(LogLevelDebug, "subscriber '%s' got a new publisher '%s'",
+		sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+		sp.address)
+
+outer:
 	for {
-		ok := func() bool {
-			err := sp.runInner()
-			if err == errSubscriberPubTerminate {
-				return false
-			}
+		err := sp.runInner()
+		if err == nil { // terminated
+			break outer
+		}
 
-			t := time.NewTimer(5 * time.Second)
-			defer t.Stop()
+		if err != io.EOF {
+			sp.sub.conf.Node.Log(LogLevelError,
+				"subscriber '%s' got an error: %s",
+				sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+				err.Error())
+		}
 
-			select {
-			case <-t.C:
-				return true
+		select {
+		case <-time.After(subscriberPubRestartPause):
 
-			case <-sp.ctx.Done():
-				return false
-			}
-		}()
-		if !ok {
-			break
+		case <-sp.ctx.Done():
+			break outer
 		}
 	}
 
 	sp.ctxCancel()
+
+	sp.sub.conf.Node.Log(LogLevelDebug, "subscriber '%s' doesn't have publisher '%s' anymore",
+		sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+		sp.address)
 }
 
 func (sp *subscriberPublisher) runInner() error {
+	sp.sub.conf.Node.Log(LogLevelDebug, "subscriber '%s' is connecting to publisher '%s'",
+		sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+		sp.address)
+
 	xcs := apislave.NewClient(sp.address, sp.sub.conf.Node.absoluteName())
 
 	subDone := make(chan struct{}, 1)
-	var res *apislave.ResponseRequestTopic
+	var proto []interface{}
 	var err error
+
 	go func() {
 		defer close(subDone)
 
@@ -95,32 +143,32 @@ func (sp *subscriberPublisher) runInner() error {
 				return [][]interface{}{{"TCPROS"}}
 			}
 
-			nodeIP, _, _ := net.SplitHostPort(sp.sub.conf.Node.nodeAddr.String())
 			return [][]interface{}{{
 				"UDPROS",
 				func() []byte {
-					buf := bytes.NewBuffer(nil)
-					protocommon.HeaderEncode(buf, &protoudp.HeaderSubscriber{
-						Callerid: sp.sub.conf.Node.absoluteName(),
-						Md5sum:   sp.sub.msgMd5,
-						Topic:    sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
-						Type:     sp.sub.msgType,
+					var buf bytes.Buffer
+					protocommon.HeaderEncode(&buf, &protoudp.HeaderSubscriber{
+						Callerid:          sp.sub.conf.Node.absoluteName(),
+						Md5sum:            sp.sub.msgMd5,
+						Topic:             sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+						Type:              sp.sub.msgType,
+						MessageDefinition: sp.sub.msgDef,
 					})
 					return buf.Bytes()[4:]
 				}(),
-				nodeIP,
+				sp.sub.conf.Node.nodeAddr.IP.String(),
 				sp.sub.conf.Node.udprosServer.Port(),
 				1500,
 			}}
 		}()
-		res, err = xcs.RequestTopic(sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic), protocols)
+		proto, err = xcs.RequestTopic(sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic), protocols)
 	}()
 
 	select {
 	case <-subDone:
 	case <-sp.ctx.Done():
 		<-subDone
-		return errSubscriberPubTerminate
+		return nil
 	}
 
 	if err != nil {
@@ -128,27 +176,27 @@ func (sp *subscriberPublisher) runInner() error {
 	}
 
 	if sp.sub.conf.Protocol == TCP {
-		return sp.runInnerTCP(res)
+		return sp.runInnerTCP(proto)
 	}
-	return sp.runInnerUDP(res)
+	return sp.runInnerUDP(proto)
 }
 
-func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) error {
-	if len(res.Protocol) != 3 {
+func (sp *subscriberPublisher) runInnerTCP(proto []interface{}) error {
+	if len(proto) != 3 {
 		return fmt.Errorf("wrong protocol length")
 	}
 
-	protoName, ok := res.Protocol[0].(string)
+	protoName, ok := proto[0].(string)
 	if !ok {
 		return fmt.Errorf("wrong protoName")
 	}
 
-	protoHost, ok := res.Protocol[1].(string)
+	protoHost, ok := proto[1].(string)
 	if !ok {
 		return fmt.Errorf("wrong protoHost")
 	}
 
-	protoPort, ok := res.Protocol[2].(int)
+	protoPort, ok := proto[2].(int)
 	if !ok {
 		return fmt.Errorf("wrong protoPort")
 	}
@@ -170,7 +218,7 @@ func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) e
 	select {
 	case <-subDone:
 	case <-sp.ctx.Done():
-		return errSubscriberPubTerminate
+		return nil
 	}
 
 	if err != nil {
@@ -180,12 +228,12 @@ func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) e
 	defer conn.Close()
 
 	if sp.sub.conf.EnableKeepAlive {
-		conn.NetConn().SetKeepAlive(true)
-		conn.NetConn().SetKeepAlivePeriod(60 * time.Second)
+		conn.NetConn().(*net.TCPConn).SetKeepAlive(true)
+		conn.NetConn().(*net.TCPConn).SetKeepAlivePeriod(60 * time.Second)
 	}
 
 	if sp.sub.conf.DisableNoDelay {
-		err := conn.NetConn().SetNoDelay(false)
+		err := conn.NetConn().(*net.TCPConn).SetNoDelay(false)
 		if err != nil {
 			return err
 		}
@@ -207,12 +255,24 @@ func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) e
 				}
 				return 1
 			}(),
+			MessageDefinition: sp.sub.msgDef,
 		})
 		if err != nil {
 			return
 		}
 
-		err = conn.ReadHeader(&outHeader)
+		var raw protocommon.HeaderRaw
+		raw, err = conn.ReadHeaderRaw()
+		if err != nil {
+			return
+		}
+
+		if strErr, ok := raw["error"]; ok {
+			err = fmt.Errorf(strErr)
+			return
+		}
+
+		err = protocommon.HeaderDecode(raw, &outHeader)
 	}()
 
 	select {
@@ -220,20 +280,27 @@ func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) e
 	case <-sp.ctx.Done():
 		conn.Close()
 		<-subDone
-		return errSubscriberPubTerminate
+		return nil
 	}
 
 	if err != nil {
 		return err
 	}
 
-	if outHeader.Topic != sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic) {
-		return fmt.Errorf("wrong topic")
+	if outHeader.Topic != "" &&
+		outHeader.Topic != sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic) {
+		return fmt.Errorf("wrong topic (expected '%s', got '%s')",
+			sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+			outHeader.Topic)
 	}
 
 	if outHeader.Md5sum != sp.sub.msgMd5 {
-		return fmt.Errorf("wrong md5")
+		return fmt.Errorf("wrong message checksum")
 	}
+
+	sp.sub.conf.Node.Log(LogLevelDebug, "subscriber '%s' is reading from publisher '%s' with TCP",
+		sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+		sp.address)
 
 	if sp.sub.conf.onPublisher != nil {
 		sp.sub.conf.onPublisher()
@@ -245,7 +312,7 @@ func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) e
 
 		for {
 			msg := reflect.New(sp.sub.msgMsg).Interface()
-			err = conn.ReadMessage(msg)
+			err = conn.ReadMessage(msg, false)
 			if err != nil {
 				return
 			}
@@ -271,31 +338,31 @@ func (sp *subscriberPublisher) runInnerTCP(res *apislave.ResponseRequestTopic) e
 	case <-sp.ctx.Done():
 		conn.Close()
 		<-subDone
-		return errSubscriberPubTerminate
+		return nil
 	}
 }
 
-func (sp *subscriberPublisher) runInnerUDP(res *apislave.ResponseRequestTopic) error {
-	if len(res.Protocol) != 6 {
+func (sp *subscriberPublisher) runInnerUDP(proto []interface{}) error {
+	if len(proto) != 6 {
 		return fmt.Errorf("wrong protocol length")
 	}
 
-	protoName, ok := res.Protocol[0].(string)
+	protoName, ok := proto[0].(string)
 	if !ok {
 		return fmt.Errorf("wrong protoName")
 	}
 
-	protoHost, ok := res.Protocol[1].(string)
+	protoHost, ok := proto[1].(string)
 	if !ok {
 		return fmt.Errorf("wrong protoHost")
 	}
 
-	protoPort, ok := res.Protocol[2].(int)
+	protoPort, ok := proto[2].(int)
 	if !ok {
 		return fmt.Errorf("wrong protoPort")
 	}
 
-	protoID, ok := res.Protocol[3].(int)
+	protoID, ok := proto[3].(int)
 	if !ok {
 		return fmt.Errorf("wrong protoID")
 	}
@@ -304,10 +371,16 @@ func (sp *subscriberPublisher) runInnerUDP(res *apislave.ResponseRequestTopic) e
 		return fmt.Errorf("wrong protoName")
 	}
 
-	// solve host and port
+	// solve remote host and port
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(protoHost, strconv.FormatInt(int64(protoPort), 10)))
 	if err != nil {
 		return fmt.Errorf("unable to solve host")
+	}
+
+	sp.localIPs = loadLocalIPs()
+
+	if sp.localIPs.contains(addr.IP) {
+		sp.udpAddrIsLocal = true
 	}
 
 	sp.udpAddr = addr
@@ -328,6 +401,10 @@ func (sp *subscriberPublisher) runInnerUDP(res *apislave.ResponseRequestTopic) e
 		}
 		close(sp.udpFrame)
 	}()
+
+	sp.sub.conf.Node.Log(LogLevelDebug, "subscriber '%s' is reading from publisher '%s' with UDP",
+		sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+		sp.address)
 
 	if sp.sub.conf.onPublisher != nil {
 		sp.sub.conf.onPublisher()
@@ -370,7 +447,7 @@ func (sp *subscriberPublisher) runInnerUDP(res *apislave.ResponseRequestTopic) e
 		case frame := <-sp.udpFrame:
 			switch frame.Opcode {
 			case protoudp.Data0:
-				curMsg = append([]byte{}, frame.Content...)
+				curMsg = append([]byte{}, frame.Payload...)
 				curFieldID = 0
 				curFieldCount = int(frame.BlockID)
 
@@ -378,13 +455,13 @@ func (sp *subscriberPublisher) runInnerUDP(res *apislave.ResponseRequestTopic) e
 				if int(frame.BlockID) != (curFieldID + 1) {
 					continue
 				}
-				curMsg = append(curMsg, frame.Content...)
+				curMsg = append(curMsg, frame.Payload...)
 				curFieldID++
 			}
 
 			if (curFieldID + 1) == curFieldCount {
 				msg := reflect.New(sp.sub.msgMsg).Interface()
-				err := protocommon.MessageDecode(bytes.NewBuffer(curMsg), msg)
+				err := protocommon.MessageDecode(bytes.NewReader(curMsg), msg)
 				if err != nil {
 					continue
 				}
@@ -405,7 +482,31 @@ func (sp *subscriberPublisher) runInnerUDP(res *apislave.ResponseRequestTopic) e
 				<-readerDone
 			}
 
-			return errSubscriberPubTerminate
+			return nil
 		}
+	}
+}
+
+func (sp *subscriberPublisher) busInfo() []interface{} {
+	proto := func() string {
+		if sp.sub.conf.Protocol == UDP {
+			return "UDPROS"
+		}
+		return "TCPROS"
+	}()
+
+	ur := (&url.URL{
+		Scheme: "http",
+		Host:   sp.address,
+		Path:   "/",
+	}).String()
+
+	return []interface{}{
+		0,
+		ur,
+		"i",
+		proto,
+		sp.sub.conf.Node.absoluteTopicName(sp.sub.conf.Topic),
+		true,
 	}
 }

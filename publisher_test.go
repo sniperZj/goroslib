@@ -1,6 +1,8 @@
 package goroslib
 
 import (
+	"bytes"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -9,12 +11,16 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/aler9/goroslib/pkg/apislave"
+	"github.com/aler9/goroslib/pkg/msgproc"
 	"github.com/aler9/goroslib/pkg/msgs/std_msgs"
+	"github.com/aler9/goroslib/pkg/protocommon"
+	"github.com/aler9/goroslib/pkg/prototcp"
+	"github.com/aler9/goroslib/pkg/protoudp"
 )
 
-func TestPublisherRegister(t *testing.T) {
-	m, err := newContainerMaster()
-	require.NoError(t, err)
+func TestPublisherOpen(t *testing.T) {
+	m := newContainerMaster(t)
 	defer m.close()
 
 	n, err := NewNode(NodeConf{
@@ -60,88 +66,41 @@ func TestPublisherRegister(t *testing.T) {
 	require.Equal(t, false, ok)
 }
 
-func TestPublisherWriteAfterSub(t *testing.T) {
-	sent := &TestMessage{
-		A: 1,
-		B: []TestParent{
-			{
-				A: "other test",
-				B: time.Unix(1500, 1345).UTC(),
-			},
-		},
-	}
+func TestPublisherOpenErrors(t *testing.T) {
+	_, err := NewPublisher(PublisherConf{})
+	require.Error(t, err)
 
-	for _, sub := range []string{
-		"cpp",
-		"go",
-	} {
-		t.Run(sub, func(t *testing.T) {
-			m, err := newContainerMaster()
-			require.NoError(t, err)
-			defer m.close()
+	m := newContainerMaster(t)
+	defer m.close()
 
-			var subc *container
-			var recv chan *TestMessage
+	n, err := NewNode(NodeConf{
+		Namespace:     "/myns",
+		Name:          "goroslib-server",
+		MasterAddress: m.IP() + ":11311",
+	})
+	require.NoError(t, err)
+	defer n.Close()
 
-			switch sub {
-			case "cpp":
-				var err error
-				subc, err = newContainer("node-sub", m.IP())
-				require.NoError(t, err)
+	_, err = NewPublisher(PublisherConf{
+		Node: n,
+	})
+	require.Error(t, err)
 
-			case "go":
-				ns, err := NewNode(NodeConf{
-					Namespace:     "/myns",
-					Name:          "goroslibsub",
-					MasterAddress: m.IP() + ":11311",
-				})
-				require.NoError(t, err)
-				defer ns.Close()
+	_, err = NewPublisher(PublisherConf{
+		Node:  n,
+		Topic: "mytopic",
+	})
+	require.Error(t, err)
 
-				recv = make(chan *TestMessage)
-				sub, err := NewSubscriber(SubscriberConf{
-					Node:  ns,
-					Topic: "test_topic",
-					Callback: func(msg *TestMessage) {
-						recv <- msg
-					},
-				})
-				require.NoError(t, err)
-				defer sub.Close()
-			}
-
-			n, err := NewNode(NodeConf{
-				Namespace:     "/myns",
-				Name:          "goroslib",
-				MasterAddress: m.IP() + ":11311",
-			})
-			require.NoError(t, err)
-			defer n.Close()
-
-			pub, err := NewPublisher(PublisherConf{
-				Node:  n,
-				Topic: "test_topic",
-				Msg:   &TestMessage{},
-			})
-			require.NoError(t, err)
-			defer pub.Close()
-
-			time.Sleep(1 * time.Second)
-
-			pub.Write(sent)
-
-			switch sub {
-			case "cpp":
-				require.Equal(t, "1 other test 5776731014620\n", subc.waitOutput())
-
-			case "go":
-				require.Equal(t, sent, <-recv)
-			}
-		})
-	}
+	_, err = NewPublisher(PublisherConf{
+		Node:  n,
+		Topic: "mytopic",
+		Msg:   123,
+	})
+	require.Error(t, err)
 }
 
-func TestPublisherWriteBeforeSubNoLatch(t *testing.T) {
+func TestPublisherWrite(t *testing.T) {
 	expected1 := &TestMessage{
 		A: 1,
 		B: []TestParent{
@@ -160,8 +119,7 @@ func TestPublisherWriteBeforeSubNoLatch(t *testing.T) {
 		"rostopic echo",
 	} {
 		t.Run(sub, func(t *testing.T) {
-			m, err := newContainerMaster()
-			require.NoError(t, err)
+			m := newContainerMaster(t)
 			defer m.close()
 
 			n, err := NewNode(NodeConf{
@@ -195,9 +153,7 @@ func TestPublisherWriteBeforeSubNoLatch(t *testing.T) {
 
 			switch sub {
 			case "cpp":
-				var err error
-				subc, err = newContainer("node-sub", m.IP())
-				require.NoError(t, err)
+				subc = newContainer(t, "node-sub", m.IP())
 
 			case "go":
 				ns, err := NewNode(NodeConf{
@@ -210,20 +166,61 @@ func TestPublisherWriteBeforeSubNoLatch(t *testing.T) {
 
 				recv = make(chan *TestMessage)
 
-				sub, err := NewSubscriber(SubscriberConf{
-					Node:  ns,
-					Topic: "test_topic",
-					Callback: func(msg *TestMessage) {
-						recv <- msg
-					},
-				})
+				uris, err := ns.apiMasterClient.RegisterSubscriber(
+					ns.absoluteTopicName("test_topic"),
+					"goroslib/TestMessage",
+					ns.apiSlaveServer.URL())
 				require.NoError(t, err)
-				defer sub.Close()
+
+				addr, err := urlToAddress(uris[0])
+				require.NoError(t, err)
+
+				xcs := apislave.NewClient(addr, ns.absoluteName())
+
+				proto, err := xcs.RequestTopic(
+					ns.absoluteTopicName("test_topic"),
+					[][]interface{}{{"TCPROS"}})
+				require.NoError(t, err)
+				require.Equal(t, "TCPROS", proto[0])
+
+				addr = net.JoinHostPort(proto[1].(string),
+					strconv.FormatInt(int64(proto[2].(int)), 10))
+
+				conn, err := prototcp.NewClient(addr)
+				require.NoError(t, err)
+				defer conn.Close()
+
+				msgMd5, err := msgproc.MD5(TestMessage{})
+				require.NoError(t, err)
+
+				go func() {
+					err := conn.WriteHeader(&prototcp.HeaderSubscriber{
+						Callerid:   ns.absoluteName(),
+						Md5sum:     msgMd5,
+						Topic:      ns.absoluteTopicName("test_topic"),
+						Type:       "goroslib/TestMessage",
+						TcpNodelay: 1,
+					})
+					require.NoError(t, err)
+
+					raw, err := conn.ReadHeaderRaw()
+					require.NoError(t, err)
+
+					var outHeader prototcp.HeaderPublisher
+					err = protocommon.HeaderDecode(raw, &outHeader)
+					require.NoError(t, err)
+
+					require.Equal(t, "/myns/test_topic", outHeader.Topic)
+					require.Equal(t, msgMd5, outHeader.Md5sum)
+
+					var msg TestMessage
+					err = conn.ReadMessage(&msg, true)
+					require.NoError(t, err)
+					recv <- &msg
+				}()
 
 			case "rostopic echo":
-				var err error
-				subc, err = newContainer("rostopic-echo", m.IP())
-				require.NoError(t, err)
+				subc = newContainer(t, "rostopic-echo", m.IP())
 			}
 
 			time.Sleep(1 * time.Second)
@@ -244,7 +241,7 @@ func TestPublisherWriteBeforeSubNoLatch(t *testing.T) {
 	}
 }
 
-func TestPublisherWriteBeforeSubLatch(t *testing.T) {
+func TestPublisherWriteLatch(t *testing.T) {
 	expected1 := &TestMessage{
 		A: 1,
 		B: []TestParent{
@@ -263,8 +260,7 @@ func TestPublisherWriteBeforeSubLatch(t *testing.T) {
 		"rostopic echo",
 	} {
 		t.Run(sub, func(t *testing.T) {
-			m, err := newContainerMaster()
-			require.NoError(t, err)
+			m := newContainerMaster(t)
 			defer m.close()
 
 			n, err := NewNode(NodeConf{
@@ -296,45 +292,86 @@ func TestPublisherWriteBeforeSubLatch(t *testing.T) {
 
 			pub.Write(expected)
 
-			ns, err := NewNode(NodeConf{
-				Namespace:     "/myns",
-				Name:          "goroslibsub",
-				MasterAddress: m.IP() + ":11311",
-			})
-			require.NoError(t, err)
-			defer ns.Close()
-
 			switch sub {
 			case "cpp":
-				subc, err := newContainer("node-sub", m.IP())
-				require.NoError(t, err)
+				subc := newContainer(t, "node-sub", m.IP())
 				require.Equal(t, "1 other test 5776731014620\n", subc.waitOutput())
 
 			case "go":
-				recv := make(chan *TestMessage)
-
-				sub, err := NewSubscriber(SubscriberConf{
-					Node:  ns,
-					Topic: "test_topic",
-					Callback: func(msg *TestMessage) {
-						recv <- msg
-					},
+				ns, err := NewNode(NodeConf{
+					Namespace:     "/myns",
+					Name:          "goroslibsub",
+					MasterAddress: m.IP() + ":11311",
 				})
 				require.NoError(t, err)
-				defer sub.Close()
+				defer ns.Close()
+
+				recv := make(chan *TestMessage)
+
+				uris, err := ns.apiMasterClient.RegisterSubscriber(
+					ns.absoluteTopicName("test_topic"),
+					"goroslib/TestMessage",
+					ns.apiSlaveServer.URL())
+				require.NoError(t, err)
+
+				addr, err := urlToAddress(uris[0])
+				require.NoError(t, err)
+
+				xcs := apislave.NewClient(addr, ns.absoluteName())
+
+				proto, err := xcs.RequestTopic(
+					ns.absoluteTopicName("test_topic"),
+					[][]interface{}{{"TCPROS"}})
+				require.NoError(t, err)
+				require.Equal(t, "TCPROS", proto[0])
+
+				addr = net.JoinHostPort(proto[1].(string),
+					strconv.FormatInt(int64(proto[2].(int)), 10))
+
+				conn, err := prototcp.NewClient(addr)
+				require.NoError(t, err)
+				defer conn.Close()
+
+				msgMd5, err := msgproc.MD5(TestMessage{})
+				require.NoError(t, err)
+
+				go func() {
+					err := conn.WriteHeader(&prototcp.HeaderSubscriber{
+						Callerid:   ns.absoluteName(),
+						Md5sum:     msgMd5,
+						Topic:      ns.absoluteTopicName("test_topic"),
+						Type:       "goroslib/TestMessage",
+						TcpNodelay: 1,
+					})
+					require.NoError(t, err)
+
+					raw, err := conn.ReadHeaderRaw()
+					require.NoError(t, err)
+
+					var outHeader prototcp.HeaderPublisher
+					err = protocommon.HeaderDecode(raw, &outHeader)
+					require.NoError(t, err)
+
+					require.Equal(t, "/myns/test_topic", outHeader.Topic)
+					require.Equal(t, msgMd5, outHeader.Md5sum)
+
+					var msg TestMessage
+					err = conn.ReadMessage(&msg, true)
+					require.NoError(t, err)
+					recv <- &msg
+				}()
 
 				require.Equal(t, expected, <-recv)
 
 			case "rostopic echo":
-				subc, err := newContainer("rostopic-echo", m.IP())
-				require.NoError(t, err)
+				subc := newContainer(t, "rostopic-echo", m.IP())
 				require.Equal(t, "data: 45.5\n---\n", subc.waitOutput())
 			}
 		})
 	}
 }
 
-func TestPublisherWriteUdp(t *testing.T) {
+func TestPublisherWriteUDP(t *testing.T) {
 	sent := &std_msgs.Int64MultiArray{}
 	for i := int64(1); i <= 400; i++ {
 		sent.Data = append(sent.Data, i)
@@ -345,41 +382,8 @@ func TestPublisherWriteUdp(t *testing.T) {
 		"go",
 	} {
 		t.Run(sub, func(t *testing.T) {
-			m, err := newContainerMaster()
-			require.NoError(t, err)
+			m := newContainerMaster(t)
 			defer m.close()
-
-			ns, err := NewNode(NodeConf{
-				Namespace:     "/myns",
-				Name:          "goroslibsub",
-				MasterAddress: m.IP() + ":11311",
-			})
-			require.NoError(t, err)
-			defer ns.Close()
-
-			var subc *container
-			var recv chan *std_msgs.Int64MultiArray
-
-			switch sub {
-			case "cpp":
-				var err error
-				subc, err = newContainer("node-sub-udp", m.IP())
-				require.NoError(t, err)
-
-			case "go":
-				recv = make(chan *std_msgs.Int64MultiArray)
-
-				sub, err := NewSubscriber(SubscriberConf{
-					Node:  ns,
-					Topic: "test_topic",
-					Callback: func(msg *std_msgs.Int64MultiArray) {
-						recv <- msg
-					},
-					Protocol: UDP,
-				})
-				require.NoError(t, err)
-				defer sub.Close()
-			}
 
 			n, err := NewNode(NodeConf{
 				Namespace:     "/myns",
@@ -396,6 +400,87 @@ func TestPublisherWriteUdp(t *testing.T) {
 			})
 			require.NoError(t, err)
 			defer pub.Close()
+
+			var subc *container
+			var recv chan *std_msgs.Int64MultiArray
+
+			switch sub {
+			case "cpp":
+				subc = newContainer(t, "node-sub-udp", m.IP())
+
+			case "go":
+				ns, err := NewNode(NodeConf{
+					Namespace:     "/myns",
+					Name:          "goroslibsub",
+					MasterAddress: m.IP() + ":11311",
+				})
+				require.NoError(t, err)
+				defer ns.Close()
+
+				recv = make(chan *std_msgs.Int64MultiArray)
+
+				uris, err := ns.apiMasterClient.RegisterSubscriber(
+					ns.absoluteTopicName("test_topic"),
+					"std_msgs/Int64MultiArray",
+					ns.apiSlaveServer.URL())
+				require.NoError(t, err)
+
+				addr, err := urlToAddress(uris[0])
+				require.NoError(t, err)
+
+				xcs := apislave.NewClient(addr, ns.absoluteName())
+
+				msgMd5, err := msgproc.MD5(std_msgs.Int64MultiArray{})
+				require.NoError(t, err)
+
+				udprosServer, err := protoudp.NewServer(ns.nodeAddr.IP.String() + ":3334")
+				require.NoError(t, err)
+
+				proto, err := xcs.RequestTopic(
+					ns.absoluteTopicName("test_topic"),
+					[][]interface{}{{
+						"UDPROS",
+						func() []byte {
+							var buf bytes.Buffer
+							protocommon.HeaderEncode(&buf, &protoudp.HeaderSubscriber{
+								Callerid: ns.absoluteName(),
+								Md5sum:   msgMd5,
+								Topic:    ns.absoluteTopicName("test_topic"),
+								Type:     "std_msgs/Int64MultiArray",
+							})
+							return buf.Bytes()[4:]
+						}(),
+						n.nodeAddr.IP.String(),
+						udprosServer.Port(),
+						1500,
+					}})
+				require.NoError(t, err)
+				require.Equal(t, "UDPROS", proto[0])
+
+				go func() {
+					var buf []byte
+
+					frame, _, err := udprosServer.ReadFrame()
+					require.NoError(t, err)
+					require.Equal(t, protoudp.Data0, frame.Opcode)
+					buf = append(buf, frame.Payload...)
+
+					frame, _, err = udprosServer.ReadFrame()
+					require.NoError(t, err)
+					require.Equal(t, protoudp.DataN, frame.Opcode)
+					buf = append(buf, frame.Payload...)
+
+					frame, _, err = udprosServer.ReadFrame()
+					require.NoError(t, err)
+					require.Equal(t, protoudp.DataN, frame.Opcode)
+					buf = append(buf, frame.Payload...)
+
+					var msg std_msgs.Int64MultiArray
+					err = protocommon.MessageDecode(bytes.NewReader(buf), &msg)
+					require.NoError(t, err)
+					recv <- &msg
+				}()
+			}
 
 			time.Sleep(1 * time.Second)
 
@@ -418,8 +503,7 @@ func TestPublisherWriteUdp(t *testing.T) {
 }
 
 func TestPublisherRostopicHz(t *testing.T) {
-	m, err := newContainerMaster()
-	require.NoError(t, err)
+	m := newContainerMaster(t)
 	defer m.close()
 
 	n, err := NewNode(NodeConf{
@@ -459,8 +543,7 @@ func TestPublisherRostopicHz(t *testing.T) {
 		}
 	}()
 
-	rt, err := newContainer("rostopic-hz", m.IP())
-	require.NoError(t, err)
+	rt := newContainer(t, "rostopic-hz", m.IP())
 
 	recv := rt.waitOutput()
 	lines := strings.Split(recv, "\n")
@@ -475,10 +558,132 @@ func TestPublisherRostopicHz(t *testing.T) {
 	}
 
 	v, _ := strconv.ParseFloat(ma[1], 64)
-	require.Greater(t, v, 0.195)
-	require.Less(t, v, 0.205)
+	require.Greater(t, v, 0.192)
+	require.Less(t, v, 0.208)
 
 	v, _ = strconv.ParseFloat(ma[2], 64)
-	require.Greater(t, v, 0.195)
-	require.Less(t, v, 0.205)
+	require.Greater(t, v, 0.192)
+	require.Less(t, v, 0.208)
+}
+
+func TestPublisherAcceptErrors(t *testing.T) {
+	t.Run("invalid header", func(t *testing.T) {
+		m := newContainerMaster(t)
+		defer m.close()
+
+		n, err := NewNode(NodeConf{
+			Namespace:     "/myns",
+			Name:          "goroslib",
+			MasterAddress: m.IP() + ":11311",
+		})
+		require.NoError(t, err)
+		defer n.Close()
+
+		pub, err := NewPublisher(PublisherConf{
+			Node:  n,
+			Topic: "test_topic",
+			Msg:   &std_msgs.Float64{},
+		})
+		require.NoError(t, err)
+		defer pub.Close()
+
+		ns, err := NewNode(NodeConf{
+			Namespace:     "/myns",
+			Name:          "goroslibsub",
+			MasterAddress: m.IP() + ":11311",
+		})
+		require.NoError(t, err)
+		defer ns.Close()
+
+		uris, err := ns.apiMasterClient.RegisterSubscriber(
+			ns.absoluteTopicName("test_topic"),
+			"std_msgs/Int64MultiArray",
+			ns.apiSlaveServer.URL())
+		require.NoError(t, err)
+
+		addr, err := urlToAddress(uris[0])
+		require.NoError(t, err)
+
+		xcs := apislave.NewClient(addr, ns.absoluteName())
+
+		proto, err := xcs.RequestTopic(
+			ns.absoluteTopicName("test_topic"),
+			[][]interface{}{{"TCPROS"}})
+		require.NoError(t, err)
+
+		addr = net.JoinHostPort(proto[1].(string),
+			strconv.FormatInt(int64(proto[2].(int)), 10))
+
+		conn, err := prototcp.NewClient(addr)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		conn.NetConn().Write([]byte{0x01})
+
+		buf := make([]byte, 1024)
+		_, err = conn.NetConn().Read(buf)
+		require.Error(t, err)
+	})
+
+	t.Run("invalid header 2", func(t *testing.T) {
+		m := newContainerMaster(t)
+		defer m.close()
+
+		n, err := NewNode(NodeConf{
+			Namespace:     "/myns",
+			Name:          "goroslib",
+			MasterAddress: m.IP() + ":11311",
+		})
+		require.NoError(t, err)
+		defer n.Close()
+
+		pub, err := NewPublisher(PublisherConf{
+			Node:  n,
+			Topic: "test_topic",
+			Msg:   &std_msgs.Float64{},
+		})
+		require.NoError(t, err)
+		defer pub.Close()
+
+		ns, err := NewNode(NodeConf{
+			Namespace:     "/myns",
+			Name:          "goroslibsub",
+			MasterAddress: m.IP() + ":11311",
+		})
+		require.NoError(t, err)
+		defer ns.Close()
+
+		uris, err := ns.apiMasterClient.RegisterSubscriber(
+			ns.absoluteTopicName("test_topic"),
+			"std_msgs/Int64MultiArray",
+			ns.apiSlaveServer.URL())
+		require.NoError(t, err)
+
+		addr, err := urlToAddress(uris[0])
+		require.NoError(t, err)
+
+		xcs := apislave.NewClient(addr, ns.absoluteName())
+
+		proto, err := xcs.RequestTopic(
+			ns.absoluteTopicName("test_topic"),
+			[][]interface{}{{"TCPROS"}})
+		require.NoError(t, err)
+
+		addr = net.JoinHostPort(proto[1].(string),
+			strconv.FormatInt(int64(proto[2].(int)), 10))
+
+		conn, err := prototcp.NewClient(addr)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		type HeaderInvalid struct {
+			Topic string
+		}
+
+		conn.WriteHeader(&HeaderInvalid{Topic: "invalid"})
+
+		buf := make([]byte, 1024)
+		_, err = conn.NetConn().Read(buf)
+		require.Error(t, err)
+	})
 }

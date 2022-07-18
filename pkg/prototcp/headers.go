@@ -6,9 +6,6 @@ type HeaderError struct {
 	Error string
 }
 
-// IsHeader implements protocommon.Header.
-func (*HeaderError) IsHeader() {}
-
 // HeaderSubscriber is a subscriber header.
 type HeaderSubscriber struct {
 	Callerid          string
@@ -16,23 +13,18 @@ type HeaderSubscriber struct {
 	Type              string
 	Md5sum            string
 	MessageDefinition string
-	TcpNodelay        int //nolint:golint
+	TcpNodelay        int //nolint:revive
 }
-
-// IsHeader implements protocommon.Header.
-func (*HeaderSubscriber) IsHeader() {}
 
 // HeaderPublisher is a publisher header.
 type HeaderPublisher struct {
-	Topic    string
-	Type     string
-	Md5sum   string
-	Callerid string
-	Latching int
+	Topic             string
+	Type              string
+	Md5sum            string
+	Callerid          string
+	Latching          int
+	MessageDefinition string
 }
-
-// IsHeader implements protocommon.Header.
-func (*HeaderPublisher) IsHeader() {}
 
 // HeaderServiceClient is a service client header.
 type HeaderServiceClient struct {
@@ -42,9 +34,6 @@ type HeaderServiceClient struct {
 	Persistent int
 }
 
-// IsHeader implements protocommon.Header.
-func (*HeaderServiceClient) IsHeader() {}
-
 // HeaderServiceProvider is a service provider event.
 type HeaderServiceProvider struct {
 	Callerid     string
@@ -53,6 +42,3 @@ type HeaderServiceProvider struct {
 	ResponseType string
 	Type         string
 }
-
-// IsHeader implements protocommon.Header.
-func (*HeaderServiceProvider) IsHeader() {}

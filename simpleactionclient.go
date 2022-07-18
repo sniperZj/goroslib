@@ -6,13 +6,34 @@ import (
 	"sync"
 )
 
-type simpleActionClientGoalState int
+type simpleActionClientGoalSimpleState int
 
 const (
-	simpleActionClientGoalStatePending simpleActionClientGoalState = iota
-	simpleActionClientGoalStateActive
-	simpleActionClientGoalStateDone
+	simpleActionClientGoalSimpleStatePending simpleActionClientGoalSimpleState = iota
+	simpleActionClientGoalSimpleStateActive
+	simpleActionClientGoalSimpleStateDone
 )
+
+// SimpleActionClientGoalState is the state of a goal of a simple action client.
+type SimpleActionClientGoalState int
+
+// standard goal states.
+const (
+	SimpleActionClientGoalStatePending SimpleActionClientGoalState = iota
+	SimpleActionClientGoalStateActive
+	SimpleActionClientGoalStateRecalled
+	SimpleActionClientGoalStateRejected
+	SimpleActionClientGoalStatePreempted
+	SimpleActionClientGoalStateAborted
+	SimpleActionClientGoalStateSucceeded
+	SimpleActionClientGoalStateLost
+)
+
+type simpleActionClientGoalHandler struct {
+	conf  SimpleActionClientGoalConf
+	state simpleActionClientGoalSimpleState
+	gh    *ActionClientGoalHandler
+}
 
 // SimpleActionClientConf is the configuration of a SimpleActionClient.
 type SimpleActionClientConf struct {
@@ -26,16 +47,11 @@ type SimpleActionClientConf struct {
 	Action interface{}
 }
 
-type simpleActionClientGoalHandler struct {
-	conf  SimpleActionClientGoalConf
-	state simpleActionClientGoalState
-}
-
 // SimpleActionClient is a ROS simple action client, an entity that can call simple actions.
 type SimpleActionClient struct {
-	ac      *ActionClient
-	mutex   sync.Mutex
-	curGoal *simpleActionClientGoalHandler
+	ac    *ActionClient
+	mutex sync.Mutex
+	sgh   *simpleActionClientGoalHandler
 }
 
 // NewSimpleActionClient allocates a SimpleActionClient.
@@ -87,15 +103,21 @@ func (sac *SimpleActionClient) SendGoal(conf SimpleActionClientGoalConf) error {
 		if cbt.Kind() != reflect.Func {
 			return fmt.Errorf("OnDone is not a function")
 		}
-		if cbt.NumIn() != 1 {
-			return fmt.Errorf("OnDone must accept a single argument")
+
+		if cbt.NumIn() != 2 {
+			return fmt.Errorf("OnDone must accept 2 arguments")
 		}
+		if cbt.In(0) != reflect.TypeOf(SimpleActionClientGoalState(0)) {
+			return fmt.Errorf("OnDone 1st argument must be %s, while is %v",
+				reflect.TypeOf(SimpleActionClientGoalState(0)), cbt.In(0))
+		}
+		if cbt.In(1) != reflect.PtrTo(sac.ac.resType) {
+			return fmt.Errorf("OnDone 2nd argument must be %s, while is %v",
+				reflect.PtrTo(sac.ac.resType), cbt.In(1))
+		}
+
 		if cbt.NumOut() != 0 {
 			return fmt.Errorf("OnDone must not return any value")
-		}
-		if cbt.In(0) != reflect.PtrTo(sac.ac.resType) {
-			return fmt.Errorf("OnDone 1st argument must be %s, while is %v",
-				reflect.PtrTo(sac.ac.resType), cbt.In(0))
 		}
 	}
 
@@ -104,28 +126,30 @@ func (sac *SimpleActionClient) SendGoal(conf SimpleActionClientGoalConf) error {
 		if cbt.Kind() != reflect.Func {
 			return fmt.Errorf("OnFeedback is not a function")
 		}
+
 		if cbt.NumIn() != 1 {
 			return fmt.Errorf("OnFeedback must accept a single argument")
-		}
-		if cbt.NumOut() != 0 {
-			return fmt.Errorf("OnFeedback must not return any value")
 		}
 		if cbt.In(0) != reflect.PtrTo(sac.ac.fbType) {
 			return fmt.Errorf("OnFeedback 1st argument must be %s, while is %v",
 				reflect.PtrTo(sac.ac.fbType), cbt.In(0))
 		}
+
+		if cbt.NumOut() != 0 {
+			return fmt.Errorf("OnFeedback must not return any value")
+		}
 	}
 
-	sgh := func() *simpleActionClientGoalHandler {
-		sac.mutex.Lock()
-		defer sac.mutex.Unlock()
-		sac.curGoal = &simpleActionClientGoalHandler{
-			conf: conf,
-		}
-		return sac.curGoal
-	}()
+	sac.mutex.Lock()
+	defer sac.mutex.Unlock()
 
-	_, err := sac.ac.SendGoal(ActionClientGoalConf{
+	sac.sgh = &simpleActionClientGoalHandler{
+		conf: conf,
+	}
+
+	fixedSGH := sac.sgh
+
+	gh, err := sac.ac.SendGoal(ActionClientGoalConf{
 		Goal: conf.Goal,
 		OnTransition: reflect.MakeFunc(
 			reflect.FuncOf([]reflect.Type{
@@ -133,7 +157,7 @@ func (sac *SimpleActionClient) SendGoal(conf SimpleActionClientGoalConf) error {
 				reflect.PtrTo(sac.ac.resType),
 			}, []reflect.Type{}, false),
 			func(in []reflect.Value) []reflect.Value {
-				return sac.onTransition(sgh, in)
+				return sac.onTransition(fixedSGH, in)
 			},
 		).Interface(),
 		OnFeedback: reflect.MakeFunc(
@@ -141,7 +165,7 @@ func (sac *SimpleActionClient) SendGoal(conf SimpleActionClientGoalConf) error {
 				reflect.PtrTo(sac.ac.fbType),
 			}, []reflect.Type{}, false),
 			func(in []reflect.Value) []reflect.Value {
-				return sac.onFeedback(sgh, in)
+				return sac.onFeedback(fixedSGH, in)
 			},
 		).Interface(),
 	})
@@ -149,77 +173,131 @@ func (sac *SimpleActionClient) SendGoal(conf SimpleActionClientGoalConf) error {
 		return err
 	}
 
+	sac.sgh.gh = gh
+
 	return nil
+}
+
+// CancelGoal cancels the current goal.
+func (sac *SimpleActionClient) CancelGoal() {
+	sac.sgh.gh.Cancel()
+}
+
+// CancelAllGoals cancels all goals running on the server.
+func (sac *SimpleActionClient) CancelAllGoals() {
+	sac.ac.CancelAllGoals()
 }
 
 func (sac *SimpleActionClient) onTransition(
 	sgh *simpleActionClientGoalHandler,
-	in []reflect.Value) []reflect.Value {
-	ok := func() bool {
-		sac.mutex.Lock()
-		defer sac.mutex.Unlock()
-		return sgh == sac.curGoal
-	}()
-	if !ok {
-		return []reflect.Value{}
+	in []reflect.Value,
+) []reflect.Value {
+	sac.mutex.Lock()
+	defer sac.mutex.Unlock()
+
+	if sgh != sac.sgh {
+		return nil
 	}
 
 	gh := in[0].Interface().(*ActionClientGoalHandler)
 	res := in[1]
 
 	switchToActive := func() {
-		sgh.state = simpleActionClientGoalStateActive
+		sgh.state = simpleActionClientGoalSimpleStateActive
 		if sgh.conf.OnActive != nil {
 			sgh.conf.OnActive()
 		}
 	}
 
 	switchToDone := func() {
-		sgh.state = simpleActionClientGoalStateDone
+		sgh.state = simpleActionClientGoalSimpleStateDone
 		if sgh.conf.OnDone != nil {
-			reflect.ValueOf(sgh.conf.OnDone).Call([]reflect.Value{res})
+			reflect.ValueOf(sgh.conf.OnDone).Call([]reflect.Value{reflect.ValueOf(sac.fullState()), res})
 		}
 	}
 
 	switch gh.CommState() {
 	case ActionClientCommStateActive:
-		if sgh.state == simpleActionClientGoalStatePending {
+		if sgh.state == simpleActionClientGoalSimpleStatePending {
 			switchToActive()
 		}
 
 	case ActionClientCommStatePreempting:
-		if sgh.state == simpleActionClientGoalStatePending {
+		if sgh.state == simpleActionClientGoalSimpleStatePending {
 			switchToActive()
 		}
 
 	case ActionClientCommStateDone:
 		switch sgh.state {
-		case simpleActionClientGoalStatePending,
-			simpleActionClientGoalStateActive:
+		case simpleActionClientGoalSimpleStatePending,
+			simpleActionClientGoalSimpleStateActive:
 			switchToDone()
 		}
 	}
 
-	return []reflect.Value{}
+	return nil
 }
 
 func (sac *SimpleActionClient) onFeedback(
 	sgh *simpleActionClientGoalHandler,
-	in []reflect.Value) []reflect.Value {
-	ok := func() bool {
-		sac.mutex.Lock()
-		defer sac.mutex.Unlock()
-		return sgh == sac.curGoal
-	}()
-	if !ok {
-		return []reflect.Value{}
+	in []reflect.Value,
+) []reflect.Value {
+	sac.mutex.Lock()
+	defer sac.mutex.Unlock()
+
+	if sgh != sac.sgh {
+		return nil
 	}
 
 	if sgh.conf.OnFeedback != nil {
-		reflect.ValueOf(sgh.conf.OnFeedback).Call([]reflect.Value{
-			in[0],
-		})
+		reflect.ValueOf(sgh.conf.OnFeedback).Call([]reflect.Value{in[0]})
 	}
 
-	return []reflect.Value{}
+	return nil
+}
+
+func (sac *SimpleActionClient) fullState() SimpleActionClientGoalState {
+	switch sac.sgh.gh.CommState() {
+	case ActionClientCommStateWaitingForGoalAck,
+		ActionClientCommStatePending,
+		ActionClientCommStateRecalling:
+		return SimpleActionClientGoalStatePending
+
+	case ActionClientCommStateActive,
+		ActionClientCommStatePreempting:
+		return SimpleActionClientGoalStateActive
+
+	case ActionClientCommStateDone:
+		ts, _ := sac.sgh.gh.TerminalState()
+		switch ts {
+		case ActionClientTerminalStateRecalled:
+			return SimpleActionClientGoalStateRecalled
+
+		case ActionClientTerminalStateRejected:
+			return SimpleActionClientGoalStateRejected
+
+		case ActionClientTerminalStatePreempted:
+			return SimpleActionClientGoalStatePreempted
+
+		case ActionClientTerminalStateAborted:
+			return SimpleActionClientGoalStateAborted
+
+		case ActionClientTerminalStateSucceeded:
+			return SimpleActionClientGoalStateSucceeded
+
+		case ActionClientTerminalStateLost:
+			return SimpleActionClientGoalStateLost
+		}
+
+	case ActionClientCommStateWaitingForResult,
+		ActionClientCommStateWaitingForCancelAck:
+		switch sac.sgh.state {
+		case simpleActionClientGoalSimpleStatePending:
+			return SimpleActionClientGoalStatePending
+
+		case simpleActionClientGoalSimpleStateActive:
+			return SimpleActionClientGoalStateActive
+		}
+	}
+	return SimpleActionClientGoalStateLost
 }

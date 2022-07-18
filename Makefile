@@ -1,6 +1,6 @@
 
-BASE_IMAGE = amd64/golang:1.15-alpine3.12
-LINT_IMAGE = golangci/golangci-lint:v1.38.0
+BASE_IMAGE = golang:1.18-alpine3.15
+LINT_IMAGE = golangci/golangci-lint:v1.45.2
 
 .PHONY: $(shell ls)
 
@@ -28,15 +28,14 @@ mod-tidy:
 
 define DOCKERFILE_FORMAT
 FROM $(BASE_IMAGE)
-RUN apk add --no-cache git
-RUN GO111MODULE=on go get mvdan.cc/gofumpt
+RUN go install mvdan.cc/gofumpt@v0.3.1
 endef
 export DOCKERFILE_FORMAT
 
 format:
 	echo "$$DOCKERFILE_FORMAT" | docker build -q . -f - -t temp
 	docker run --rm -it -v $(PWD):/s -w /s temp \
-	sh -c "find . -type f -name '*.go' | xargs gofumpt -l -w"
+	sh -c "gofumpt -l -w ."
 
 define DOCKERFILE_TEST
 FROM $(BASE_IMAGE)
@@ -55,6 +54,9 @@ test:
 	temp \
 	make test-nodocker
 
+test-cmd:
+	go build -o /dev/null ./cmd/...
+
 test-examples:
 	go build -o /dev/null ./examples/...
 
@@ -66,7 +68,7 @@ test-root:
 	docker build -q testimages/$(IMG) -t goroslib-test-$(IMG)$(NL))
 	go test -v -race -coverprofile=coverage-root.txt .
 
-test-nodocker: test-examples test-pkg test-root
+test-nodocker: test-cmd test-examples test-pkg test-root
 
 lint:
 	docker run --rm -v $(PWD):/app -w /app \
@@ -76,7 +78,7 @@ lint:
 define DOCKERFILE_MSGS
 FROM $(BASE_IMAGE)
 RUN apk add --no-cache make git
-RUN GO111MODULE=on go get mvdan.cc/gofumpt
+RUN go install mvdan.cc/gofumpt@v0.3.1
 WORKDIR /s
 COPY go.mod go.sum ./
 RUN go mod download
